@@ -204,7 +204,12 @@ def _run_one(seed: int, cfg: dict, cycles: list) -> dict:
         lam = train_cfg["lambda_eol"]
         pat = 80
 
-        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            DEVICE = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            DEVICE = torch.device("mps")
+        else:
+            DEVICE = torch.device("cpu")
 
         X_train = X_train.float(); X_val = X_val.float()
         y_train = y_train.float().squeeze(-1)

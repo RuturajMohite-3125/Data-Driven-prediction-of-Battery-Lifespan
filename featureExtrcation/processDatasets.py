@@ -317,7 +317,7 @@ class HUSTDataProcessor:
         plt.show()
 
 if __name__ == "__main__":
-    pkl_path = r"E:\BL_processed\MATR\New"
+    pkl_path = "/Users/ruturaj/Master-Thesis/Dataset/MIT"
     cache_path = r"processed_hust_MIT_cache.pkl"
     processor = HUSTDataProcessor(pkl_path)
     cells_cache = processor.process_and_extract(cache_path=cache_path)

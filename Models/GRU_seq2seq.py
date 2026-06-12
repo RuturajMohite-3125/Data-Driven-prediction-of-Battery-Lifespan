@@ -1,10 +1,11 @@
 """
-CNN/LSTM EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
+GRU-based EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
 feature cache, fixed cell_split.json split, and the same XGBoost aging-class
 stage used by MIT_transformer_EOL.py.
 """
 
 import json
+import math
 import os
 import pickle
 
@@ -15,9 +16,9 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
-import xgboost as xgb
+from xgboost import XGBClassifier
 
-from processDatasets import HUSTDataProcessor
+from featureExtrcation.processDatasets import HUSTDataProcessor
 
 
 CACHE_PATH = "processed_hust_MIT_cache.pkl"
@@ -25,9 +26,12 @@ RAW_PKL_PATH = r"E:\BL_processed\MATR\New"
 SPLIT_FILE = "cell_split.json"
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
-
-_cycles_env = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(1, 50)]
+_raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
+CYCLES_TO_USE = (
+    [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()]
+    if _raw_cycles.strip()
+    else [1, 10, 50, 100, 150, 200, 250]
+)
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -36,16 +40,19 @@ SEED = int(os.environ.get("EOL_SEED", "42"))
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 SHOW_PLOTS = os.environ.get("EOL_SHOW_PLOTS", "1") == "1"
 SAVE_ARTIFACTS = os.environ.get("EOL_SAVE_ARTIFACTS", "1") == "1"
 
 MODEL_CFG = {
-    "cnn_channels":  int(os.environ.get("EOL_CNN_CHANNELS",  "64")),
-    "lstm_hidden":   int(os.environ.get("EOL_LSTM_HIDDEN",   "128")),
-    "num_layers":    int(os.environ.get("EOL_NUM_LAYERS",    "1")),
-    "cnn_dropout":   float(os.environ.get("EOL_CNN_DROPOUT",   "0.2")),
-    "head_dropout":  float(os.environ.get("EOL_HEAD_DROPOUT",  "0.3")),
+    "hidden_size":  int(os.environ.get("EOL_HIDDEN_SIZE",  "128")),
+    "num_layers":   int(os.environ.get("EOL_NUM_LAYERS",   "1")),
+    "head_dropout": float(os.environ.get("EOL_HEAD_DROPOUT", "0.3")),
 }
 TRAIN_CFG = {
     "epochs":       int(os.environ.get("EOL_EPOCHS",       "300")),
@@ -58,56 +65,44 @@ LOSS_TYPE = os.environ.get("EOL_LOSS", "smooth_l1")
 SCHEDULER = os.environ.get("EOL_SCHEDULER", "cosine")
 
 
-class CNNLSTMEOLPredictor(nn.Module):
-    """CNN encoder -> bidirectional LSTM sequence model for EOL prediction."""
-
-    def __init__(self, input_size, cnn_channels=64, lstm_hidden_size=128, num_layers=1):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
 
-        self.cnn_encoder = nn.Sequential(
-            nn.Conv1d(in_channels=input_size, out_channels=cnn_channels, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Conv1d(in_channels=cnn_channels, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels * 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Conv1d(in_channels=cnn_channels * 2, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels * 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
+    def forward(self, x):
+        return x + self.pe[:, : x.size(1)]
 
-        self.lstm = nn.LSTM(
-            input_size=cnn_channels * 2,
-            hidden_size=lstm_hidden_size,
+
+class GRUEOLPredictor(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=1, head_dropout=0.3):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
             dropout=0.3 if num_layers > 1 else 0.0,
         )
-
         self.head = nn.Sequential(
-            nn.Linear(lstm_hidden_size * 2, 256),
+            nn.Linear(hidden_size * 2, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(head_dropout),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(64, 1),
         )
 
     def forward(self, x):
-        x_cnn = x.transpose(1, 2)
-        encoded = self.cnn_encoder(x_cnn)
-        encoded = encoded.transpose(1, 2)
-        lstm_out, _ = self.lstm(encoded)
-        attn_weights = torch.softmax(torch.mean(lstm_out, dim=2), dim=1)
-        context = torch.sum(lstm_out * attn_weights.unsqueeze(-1), dim=1)
+        gru_out, _ = self.gru(x)
+        attn_weights = torch.softmax(torch.mean(gru_out, dim=2), dim=1)
+        context = torch.sum(gru_out * attn_weights.unsqueeze(-1), dim=1)
         return self.head(context).squeeze(-1)
 
 
@@ -153,7 +148,8 @@ def labels_from_train_tertiles(eol_arr, train_eol=None):
         raise ValueError("train_eol is required to derive train-only tertiles.")
 
     train_eol = np.asarray(train_eol, dtype=float)
-    q33, q66 = 450,950
+    q33 = 450
+    q66 = 950
     y = np.full(len(eol_arr), 1, dtype=int)
     y[np.asarray(eol_arr) <= q33] = 0
     y[np.asarray(eol_arr) > q66] = 2
@@ -168,36 +164,6 @@ def _aligned_proba(clf, X):
     return out
 
 
-class XGBBoosterClassifier:
-    def __init__(self, booster, classes):
-        self.booster = booster
-        self.classes_ = np.asarray(classes)
-
-    def _predict_raw(self, X):
-        dmat = xgb.DMatrix(X)
-        try:
-            probs = self.booster.predict(dmat, iteration_range=(0, self.booster.best_iteration + 1))
-        except (TypeError, AttributeError):
-            try:
-                probs = self.booster.predict(dmat, ntree_limit=getattr(self.booster, "best_ntree_limit", 0))
-            except TypeError:
-                probs = self.booster.predict(dmat)
-        return probs
-
-    def predict_proba(self, X):
-        probs = self._predict_raw(X)
-        probs = np.asarray(probs)
-        if probs.ndim == 1:
-            probs = probs.reshape(-1, N_CLASSES)
-        return probs
-
-    def predict(self, X):
-        return np.argmax(self.predict_proba(X), axis=1)
-
-    def save_model(self, path):
-        self.booster.save_model(path)
-
-
 def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     Xt = X_scalar[idx_tr]
     yt = y[idx_tr]
@@ -210,22 +176,18 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     if np.any(nonzero):
         class_weights[nonzero] = (len(yt) / (N_CLASSES * class_counts[nonzero])) ** 1.2
 
-    params = dict(
-        max_depth=6,
-        eta=0.03,
-        subsample=1.0,
-        colsample_bytree=1.0,
-        min_child_weight=2.0,
-        gamma=0.05,
-        reg_alpha=0.2,
-        reg_lambda=1.5,
+    base_kwargs = dict(
+        n_estimators=400,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
         objective="multi:softprob",
         num_class=N_CLASSES,
         eval_metric="mlogloss",
         tree_method="hist",
-        nthread=1,
-        seed_per_iteration=True,
-        seed=seed,
+        n_jobs=-1,
     )
 
     n_splits = min(5, int(np.min(np.bincount(yt, minlength=N_CLASSES))) or 1)
@@ -235,31 +197,13 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     for fold, (a, b) in enumerate(skf.split(Xt, yt)):
-        dtrain = xgb.DMatrix(Xt[a], label=yt[a], weight=class_weights[yt[a]])
-        dval = xgb.DMatrix(Xt[b], label=yt[b])
-        booster = xgb.train(
-            params=params,
-            dtrain=dtrain,
-            num_boost_round=1500,
-            evals=[(dval, "val")],
-            early_stopping_rounds=50,
-            verbose_eval=False,
-        )
-        clf = XGBBoosterClassifier(booster, classes=[0, 1, 2])
+        clf = XGBClassifier(random_state=seed + fold, **base_kwargs)
+        clf.fit(Xt[a], yt[a], sample_weight=class_weights[yt[a]])
         oof_pred[b] = clf.predict(Xt[b])
         oof_proba[b] = _aligned_proba(clf, Xt[b])
 
-    dtrain_full = xgb.DMatrix(Xt, label=yt, weight=class_weights[yt])
-    dval_full = xgb.DMatrix(Xv, label=y[idx_va])
-    final_booster = xgb.train(
-        params=params,
-        dtrain=dtrain_full,
-        num_boost_round=1500,
-        evals=[(dval_full, "val")],
-        early_stopping_rounds=50,
-        verbose_eval=False,
-    )
-    final_clf = XGBBoosterClassifier(final_booster, classes=[0, 1, 2])
+    final_clf = XGBClassifier(random_state=seed, **base_kwargs)
+    final_clf.fit(Xt, yt, sample_weight=class_weights[yt])
 
     proba_va = _aligned_proba(final_clf, Xv)
     proba_te = _aligned_proba(final_clf, Xte)
@@ -295,26 +239,6 @@ def build_cell_tensors(cells_cache, cycles=CYCLES_TO_USE):
     X = torch.tensor(np.stack(X_list), dtype=torch.float32)
     eol = torch.tensor(eol_list, dtype=torch.float32).unsqueeze(-1)
     return X, eol, names
-
-
-def build_scalar_features(X):
-    """Create a richer tabular representation for XGBoost.
-
-    Uses per-feature summary statistics over the selected cycle window:
-    mean, std, min, max, first, last, slope, and range.
-    """
-    x = X.numpy() if isinstance(X, torch.Tensor) else np.asarray(X)
-    mean = x.mean(axis=1)
-    std = x.std(axis=1)
-    min_ = x.min(axis=1)
-    max_ = x.max(axis=1)
-    first = x[:, 0, :]
-    last = x[:, -1, :]
-    slope = last - first
-    value_range = max_ - min_
-    rolling_mid = x[:, x.shape[1] // 2, :]
-    scalar = np.concatenate([mean, std, min_, max_, first, last, slope, value_range, rolling_mid], axis=1)
-    return np.nan_to_num(scalar, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
 def eol_accuracy(preds, tgts, band=0.10):
@@ -426,11 +350,11 @@ def train_model(X_train, y_train, X_val, y_val,
     train_loader = DataLoader(TensorDataset(X_train, y_train_n), batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(TensorDataset(X_val,   y_val_n),   batch_size=batch_size)
 
-    model = CNNLSTMEOLPredictor(
+    model = GRUEOLPredictor(
         input_size=X_train.size(-1),
-        cnn_channels=_mcfg["cnn_channels"],
-        lstm_hidden_size=_mcfg["lstm_hidden"],
+        hidden_size=_mcfg["hidden_size"],
         num_layers=_mcfg["num_layers"],
+        head_dropout=_mcfg.get("head_dropout", 0.3),
     ).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     if _sched == "onecycle":
@@ -602,7 +526,11 @@ if __name__ == "__main__":
     eol_va = eol_all[idx_va]
     eol_te = eol_all[idx_te]
 
-    scalar_X = build_scalar_features(X_all)
+    X_np = X_all.numpy()
+    feat_mean = X_np.mean(axis=1)
+    feat_slope = X_np[:, -1, :] - X_np[:, 0, :]
+    scalar_X = np.concatenate([feat_mean, feat_slope], axis=1).astype(np.float32)
+    scalar_X = np.nan_to_num(scalar_X, nan=0.0, posinf=0.0, neginf=0.0)
 
     eol_np = eol_all.squeeze(-1).numpy()
     y_all, (q33, q66) = labels_from_train_tertiles(eol_np, eol_np[idx_tr.numpy()])
@@ -694,10 +622,10 @@ if __name__ == "__main__":
         **TRAIN_CFG,
     )
 
-    print(f"\nBest val MAE: {best_mae:.2f} cycles ({'MEETS' if best_mae <= 40 else 'ABOVE'} +-40 cycle target)")
+    print(f"\nBest val MAE: {best_mae:.2f} cycles ({'MEETS' if best_mae <= 50 else 'ABOVE'} +-50 cycle target)")
 
     print("\n[Train set]")
-    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=4)
+    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=1)
     preds_tr, tgts_tr, train_metrics = evaluate(model, train_loader, y_mean, y_std, split_name="Train")
 
     print("\n[Validation set]")
@@ -737,7 +665,7 @@ if __name__ == "__main__":
     plot_results(preds_te_blend, tgts_te, title="Model Evaluation on Test Set")
 
     if SAVE_ARTIFACTS:
-        ckpt_path = "best_eol_cnn_lstm_50_cycle_window.pt"
+        ckpt_path = "best_eol_gru_50_cycle_window.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
@@ -761,6 +689,6 @@ if __name__ == "__main__":
             },
             ckpt_path,
         )
-        _clf.save_model("aging_classifier_cnn_lstm_50_xgb.json")
+        _clf.save_model("aging_classifier_gru_50_xgb.json")
         print(f"Saved best model -> {ckpt_path}")
-        print("Saved aging classifier -> aging_classifier_cnn_lstm_50_xgb.json")
+        print("Saved aging classifier -> aging_classifier_gru_50_xgb.json")

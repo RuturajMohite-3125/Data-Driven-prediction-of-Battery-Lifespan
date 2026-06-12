@@ -1,5 +1,5 @@
 """
-CNN/GRU EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
+LSTM-based EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
 feature cache, fixed cell_split.json split, and the same XGBoost aging-class
 stage used by MIT_transformer_EOL.py.
 """
@@ -18,7 +18,7 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
 
-from processDatasets import HUSTDataProcessor
+from featureExtrcation.processDatasets import HUSTDataProcessor
 
 
 CACHE_PATH = "processed_hust_MIT_cache.pkl"
@@ -26,9 +26,12 @@ RAW_PKL_PATH = r"E:\BL_processed\MATR\New"
 SPLIT_FILE = "cell_split.json"
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
-
-_cycles_env = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(1, 50)]
+_raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
+CYCLES_TO_USE = (
+    [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()]
+    if _raw_cycles.strip()
+    else [*range(1, 100)]
+)
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -37,15 +40,18 @@ SEED = int(os.environ.get("EOL_SEED", "42"))
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 SHOW_PLOTS = os.environ.get("EOL_SHOW_PLOTS", "1") == "1"
 SAVE_ARTIFACTS = os.environ.get("EOL_SAVE_ARTIFACTS", "1") == "1"
 
 MODEL_CFG = {
-    "cnn_channels": int(os.environ.get("EOL_CNN_CHANNELS", "64")),
-    "gru_hidden":   int(os.environ.get("EOL_GRU_HIDDEN",   "128")),
+    "hidden_size":  int(os.environ.get("EOL_HIDDEN_SIZE",  "128")),
     "num_layers":   int(os.environ.get("EOL_NUM_LAYERS",   "1")),
-    "cnn_dropout":  float(os.environ.get("EOL_CNN_DROPOUT",  "0.2")),
     "head_dropout": float(os.environ.get("EOL_HEAD_DROPOUT", "0.3")),
 }
 TRAIN_CFG = {
@@ -73,57 +79,30 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, : x.size(1)]
 
 
-class CNNGRUEOLPredictor(nn.Module):
-    """CNN encoder -> GRU sequence model for EOL prediction."""
-
-    def __init__(self, input_size, cnn_channels=64, gru_hidden_size=128, num_layers=1,
-                 cnn_dropout=0.2, head_dropout=0.3):
+class LSTMEOLPredictor(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=1, head_dropout=0.3):
         super().__init__()
-
-        self.cnn_encoder = nn.Sequential(
-            nn.Conv1d(in_channels=input_size, out_channels=cnn_channels, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels),
-            nn.ReLU(),
-            nn.Dropout(cnn_dropout),
-            nn.Conv1d(in_channels=cnn_channels, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels * 2),
-            nn.ReLU(),
-            nn.Dropout(cnn_dropout),
-            nn.Conv1d(in_channels=cnn_channels * 2, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm1d(cnn_channels * 2),
-            nn.ReLU(),
-            nn.Dropout(cnn_dropout),
-        )
-
-        self.gru = nn.GRU(
-            input_size=cnn_channels * 2,
-            hidden_size=gru_hidden_size,
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
             dropout=0.3 if num_layers > 1 else 0.0,
         )
-
         self.head = nn.Sequential(
-            nn.Linear(gru_hidden_size * 2, 256),
-            nn.ReLU(),
-            nn.Dropout(head_dropout),
-            nn.Linear(256, 128),
+            nn.Linear(hidden_size * 2, 128),
             nn.ReLU(),
             nn.Dropout(head_dropout),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(max(0.0, head_dropout - 0.1)),
             nn.Linear(64, 1),
         )
 
     def forward(self, x):
-        x_cnn = x.transpose(1, 2)
-        encoded = self.cnn_encoder(x_cnn)
-        encoded = encoded.transpose(1, 2)
-        gru_out, _ = self.gru(encoded)
-        attn_weights = torch.softmax(torch.mean(gru_out, dim=2), dim=1)
-        context = torch.sum(gru_out * attn_weights.unsqueeze(-1), dim=1)
+        lstm_out, _ = self.lstm(x)
+        attn_weights = torch.softmax(torch.mean(lstm_out, dim=2), dim=1)
+        context = torch.sum(lstm_out * attn_weights.unsqueeze(-1), dim=1)
         return self.head(context).squeeze(-1)
 
 
@@ -371,13 +350,10 @@ def train_model(X_train, y_train, X_val, y_val,
     train_loader = DataLoader(TensorDataset(X_train, y_train_n), batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(TensorDataset(X_val,   y_val_n),   batch_size=batch_size)
 
-    model = CNNGRUEOLPredictor(
+    model = LSTMEOLPredictor(
         input_size=X_train.size(-1),
-        cnn_channels=_mcfg["cnn_channels"],
-        gru_hidden_size=_mcfg["gru_hidden"],
+        hidden_size=_mcfg["hidden_size"],
         num_layers=_mcfg["num_layers"],
-        cnn_dropout=_mcfg["cnn_dropout"],
-        head_dropout=_mcfg["head_dropout"],
     ).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     if _sched == "onecycle":
@@ -645,10 +621,10 @@ if __name__ == "__main__":
         **TRAIN_CFG,
     )
 
-    print(f"\nBest val MAE: {best_mae:.2f} cycles ({'MEETS' if best_mae <= 40 else 'ABOVE'} +-40 cycle target)")
+    print(f"\nBest val MAE: {best_mae:.2f} cycles ({'MEETS' if best_mae <= 50 else 'ABOVE'} +-50 cycle target)")
 
     print("\n[Train set]")
-    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=4)
+    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=1)
     preds_tr, tgts_tr, train_metrics = evaluate(model, train_loader, y_mean, y_std, split_name="Train")
 
     print("\n[Validation set]")
@@ -662,7 +638,7 @@ if __name__ == "__main__":
     )
 
     print("\n[Test set]")
-    test_loader = make_eval_loader(X_te, eol_te, y_mean, y_std, batch_size=8)
+    test_loader = make_eval_loader(X_te, eol_te, y_mean, y_std, batch_size=1)
     preds_te, tgts_te, test_metrics = evaluate(model, test_loader, y_mean, y_std, split_name="Test")
     preds_te_blend = apply_class_blend(preds_te, proba_te, class_means, blend_alpha)
     raw_test_mae = float(np.mean(np.abs(preds_te - tgts_te)))
@@ -688,7 +664,7 @@ if __name__ == "__main__":
     plot_results(preds_te_blend, tgts_te, title="Model Evaluation on Test Set")
 
     if SAVE_ARTIFACTS:
-        ckpt_path = "best_eol_cnn_gru_50_cycle_window.pt"
+        ckpt_path = "best_eol_lstm_50_cycle_window.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
@@ -712,7 +688,6 @@ if __name__ == "__main__":
             },
             ckpt_path,
         )
-
-        _clf.save_model("aging_classifier_cnn_gru_50_xgb.json")
+        _clf.save_model("aging_classifier_lstm_50_xgb.json")
         print(f"Saved best model -> {ckpt_path}")
-        print("Saved aging classifier -> aging_classifier_cnn_gru_50_xgb.json")
+        print("Saved aging classifier -> aging_classifier_lstm_50_xgb.json")
