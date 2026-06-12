@@ -18,9 +18,10 @@ from xgboost import XGBClassifier
 from featureExtrcation.processDatasets import HUSTDataProcessor
 
 
-CACHE_PATH = "processed_hust_MIT_cache.pkl"
-RAW_PKL_PATH = r"E:\BL_processed\MATR\New"
-SPLIT_FILE = "cell_split.json"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE_PATH = os.path.join(_HERE, "processed_hust_MIT_cache.pkl")
+RAW_PKL_PATH = "/Users/ruturaj/Master-Thesis/Dataset/MIT"
+SPLIT_FILE = os.path.join(_HERE, "cell_split.json")
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 _raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
@@ -677,6 +678,6 @@ if __name__ == "__main__":
             "test_mae": test_mae,
         }, ckpt_path)
 
-        _clf.save_model("aging_classifier_50_xgb.json")
+        _clf.get_booster().save_model(os.path.join(_HERE, "aging_classifier_50_xgb.json"))
         print(f"Saved best model -> {ckpt_path}")
         print("Saved aging classifier -> aging_classifier_50_xgb.json")
