@@ -50,7 +50,7 @@ The project uses the **MIT/Stanford/Toyota LFP battery dataset** (Severson et al
 | Validation | 18      |
 | Test       | 18      |
 
-> The raw dataset is not included in this repository. Place the per-cell `.pkl` files in a directory and set `RAW_PKL_PATH` in each model script accordingly (default: `/Users/ruturaj/Master-Thesis/Dataset/MIT`).
+> The raw dataset is not included in this repository. Place the per-cell `.pkl` files in a directory and set `RAW_PKL_PATH` in each model script accordingly (default: `/Users/ruturaj/Master-Thesis/Dataset/MIT`) or alternatively use generate feature cache `processed_hust_MIT_cache.pkl`.
 
 ---
 
@@ -62,21 +62,18 @@ The project uses the **MIT/Stanford/Toyota LFP battery dataset** (Severson et al
 │   └── processDatasets.py          # Raw pkl → per-cycle feature cache
 │
 ├── Models/
-│   ├── MIT_transformer_EOL.py      # Encoder-only Transformer
-│   ├── GRU_seq2seq.py              # Bidirectional GRU with attention
-│   ├── LSTM_seq2seq.py             # Bidirectional LSTM with attention
-│   ├── CNN_GRU_EOL.py              # CNN feature extractor + GRU
-│   ├── CNN_LSTM_EOL.py             # CNN feature extractor + LSTM
-│   ├── run_transformer_config_sweep.py  # Sweep runner — Transformer
-│   ├── run_gru_config_sweep.py          # Sweep runner — GRU
-│   ├── run_lstm_config_sweep.py         # Sweep runner — LSTM
-│   ├── run_cnn_gru_config_sweep.py      # Sweep runner — CNN-GRU
-│   ├── run_cnn_lstm_config_sweep.py     # Sweep runner — CNN-LSTM
-│   ├── cell_split.json             # Fixed train/val/test cell assignments
-│   ├── processed_hust_MIT_cache.pkl     # Cached feature extraction output
-│   ├── aging_classifier_50_xgb.json         # XGBoost classifier — Transformer
-│   ├── aging_classifier_gru_50_xgb.json     # XGBoost classifier — GRU
-│   ├── aging_classifier_lstm_50_xgb.json    # XGBoost classifier — LSTM
+│   ├── MIT_transformer_EOL.py            # Transformer
+│   ├── GRU_seq2seq.py                    # GRU 
+│   ├── LSTM_seq2seq.py                   # LSTM
+│   ├── CNN_GRU_EOL.py                    # CNN feature extractor + GRU
+│   ├── CNN_LSTM_EOL.py                   # CNN feature extractor + LSTM
+│   ├── run_transformer_config_sweep.py   # Sweep runner — Transformer
+│   ├── run_gru_config_sweep.py           # Sweep runner — GRU
+│   ├── run_lstm_config_sweep.py          # Sweep runner — LSTM
+│   ├── run_cnn_gru_config_sweep.py       # Sweep runner — CNN-GRU
+│   ├── run_cnn_lstm_config_sweep.py      # Sweep runner — CNN-LSTM
+│   ├── cell_split.json                   # Fixed train/val/test cell assignments
+│   ├── processed_hust_MIT_cache.pkl      # Cached feature extraction output
 │   └── SWEEP_CONFIGS.md            # Full sweep configuration documentation
 │
 ├── Results/
@@ -84,12 +81,8 @@ The project uses the **MIT/Stanford/Toyota LFP battery dataset** (Severson et al
 │   ├── gru_sweep_report.md         # GRU-specific sweep results
 │   ├── lstm_sweep_report.md        # LSTM-specific sweep results
 │   ├── transformer_sweep_report.md # Transformer-specific sweep results
-│   └── cnn_gru_sweep_results.json  # Raw CNN-GRU sweep output
+│   └── cnn_gru_sweep_results.json  # Raw CNN-GRU sweep output --> to be rerun
 │
-├── best_eol_gru_50_cycle_window.pt          # Best GRU model checkpoint
-├── best_eol_lstm_50_cycle_window.pt         # Best LSTM model checkpoint
-├── best_eol_transformer_50_cycle_window.pt  # Best Transformer checkpoint
-├── gru_sweep_results.json          # Raw GRU sweep output
 ├── requirements.txt
 └── LICENSE
 ```
@@ -157,13 +150,6 @@ An XGBoost multi-class classifier is trained on scalar features (mean + slope ac
 
 The model receives a sequence of per-cycle features (19–21 dimensions, depending on the appended class probabilities) and produces a single scalar EOL prediction. Training uses Z-score normalisation of targets and early stopping with 80-epoch patience.
 
-**Calibration**
-
-After training, a blending coefficient α is fitted on the validation set to mix the raw neural prediction with the class-mean EOL prior:
-
-```
-final_pred = (1 - α) × neural_pred + α × (class_probs @ class_mean_eol)
-```
 
 ### Cycle Windows
 
