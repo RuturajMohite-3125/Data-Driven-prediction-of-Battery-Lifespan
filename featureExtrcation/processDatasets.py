@@ -12,6 +12,11 @@ import glob
 import os
 from scipy.stats import kurtosis, skew
 
+# Fixed output length for the SoH trajectory stored in the cache.
+# Cells with EOL < SOH_HORIZON are padded with -1 (sentinel = "not reached yet").
+SOH_HORIZON = int(os.environ.get("SOH_HORIZON", "1500"))
+
+
 class HUSTDataProcessor:
     def __init__(self, pkl_path, min_cycles=0):
         self.pkl_path = pkl_path
@@ -97,8 +102,11 @@ class HUSTDataProcessor:
             print(f"Loading cached data from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
-            print(f"Loaded {len(cache)} cells from cache.")
-            return cache
+            if cache and 'soh_traj' not in cache[0]:
+                print("Cache missing 'soh_traj' field — regenerating cache...")
+            else:
+                print(f"Loaded {len(cache)} cells from cache.")
+                return cache
 
         cells_cache = []
 
@@ -139,14 +147,19 @@ class HUSTDataProcessor:
             below = np.where(post_peak < eol_threshold)[0]
             eol_cycle = int(peak_idx + below[0]) if len(below) > 0 else len(soh_array)
 
-            # if eol_cycle < 50:
-            #     del soh_list, soh_array, cell_features
-            #     continue
+            # Normalised SoH trajectory from cycle 0 to EOL, padded to SOH_HORIZON.
+            # Cycles beyond EOL are set to -1 (sentinel so the model can mask them).
+            peak_cap = float(np.max(soh_array)) if np.max(soh_array) > 1e-8 else 1.0
+            soh_norm = soh_array / peak_cap
+            soh_traj = np.full(SOH_HORIZON, -1.0, dtype=np.float32)
+            end = min(eol_cycle, SOH_HORIZON)
+            soh_traj[:end] = soh_norm[:end]
 
             cells_cache.append({
                 'cell_name': cell_name,
                 'features': np.asarray(cell_features, dtype=np.float32),
                 'soh': soh_array,
+                'soh_traj': soh_traj,   # [SOH_HORIZON], normalised; -1 beyond EOL
                 'eol': eol_cycle,
                 'num_cycles': n_cycles,
             })
