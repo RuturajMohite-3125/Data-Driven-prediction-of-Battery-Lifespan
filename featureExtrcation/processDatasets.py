@@ -194,9 +194,16 @@ class HUSTDataProcessor:
                 else:
                     print("Expected a dict in cycle_data, but got:", type(item))
 
-    def calculate_dQdV(self, voltage, capacity):
+    def calculate_dQdV(self, voltage, capacity, v_min=None, v_max=None):
         voltage = np.array(voltage)
         capacity = np.array(capacity)
+
+        if v_min is not None or v_max is not None:
+            lo = v_min if v_min is not None else -np.inf
+            hi = v_max if v_max is not None else np.inf
+            vmask = (voltage >= lo) & (voltage <= hi)
+            voltage = voltage[vmask]
+            capacity = capacity[vmask]
 
         idx = np.argsort(voltage)
         voltage = voltage[idx]
@@ -213,6 +220,8 @@ class HUSTDataProcessor:
         dV = np.diff(V_unique)
 
         dQdV = dQ / dV
+        lo, hi = np.percentile(dQdV, [2, 98])
+        dQdV = np.clip(dQdV, lo, hi)
 
         dQdV = savgol_filter(
             dQdV,
@@ -225,17 +234,19 @@ class HUSTDataProcessor:
         Q_sorted = Q_unique[idx_q]
         V_sorted = V_unique[idx_q]
 
-        
         Q_unique2, unique_idx2 = np.unique(Q_sorted, return_index=True)
         V_unique2 = V_sorted[unique_idx2]
 
         if len(Q_unique2) < 20:
             return None
-        
+
         dV = np.diff(V_unique2)
         dQ = np.diff(Q_unique2)
 
         dVdQ = dV / dQ
+        lo, hi = np.percentile(dVdQ, [2, 98])
+        dVdQ = np.clip(dVdQ, lo, hi)
+
         dVdQ = savgol_filter(
             dVdQ,
             window_length=31,
@@ -309,7 +320,7 @@ class HUSTDataProcessor:
 
             if len(capacity) < 5:
                 continue
-          
+
             normalized = capacity / capacity[5]
             cycles = range(len(normalized))
 
@@ -329,6 +340,254 @@ class HUSTDataProcessor:
         ax.grid()
         plt.show()
 
+    def plot_soh_all(self, cells_cache, normalize=True):
+        """
+        Plot SoH curves for all cells in cells_cache, coloured by EOL length.
+
+        normalize : divide each cell's capacity by its peak value.
+        """
+        if not cells_cache:
+            print("No cells in cache.")
+            return
+
+        eols = [c['eol'] for c in cells_cache]
+        cmap = plt.cm.viridis
+        norm = plt.Normalize(vmin=min(eols), vmax=max(eols))
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        for cell in cells_cache:
+            soh = cell['soh'].copy()
+            if np.max(soh) < 0.88:
+                continue
+            if normalize and np.max(soh) > 1e-8:
+                soh = soh / np.max(soh)
+            # Savitzky-Golay: window must be odd and < len(soh)
+            wl = min(51, len(soh) if len(soh) % 2 == 1 else len(soh) - 1)
+            if wl >= 5:
+                soh = savgol_filter(soh, window_length=wl, polyorder=3, mode='nearest')
+            color = cmap(norm(cell['eol']))
+            ax.plot(range(len(soh)), soh, color=color, linewidth=0.8, alpha=0.7)
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, label="EOL Cycle")
+
+        ax.set_xlabel("Cycle Number")
+        ax.set_ylabel("Normalized Capacity (SoH)" if normalize else "Discharge Capacity (Ah)")
+        ax.set_title(f"State of Health — All Cells ({len(cells_cache)} total)")
+        ax.grid(True, alpha=0.4)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_dqdv_selected(self, cell_ids, cycle_ids, v_min=2.4, v_max=3.6):
+        """
+        Load raw pkl files and plot dQ/dV curves for selected cells and cycles.
+
+        cell_ids  : list of cell names (str) or 0-based indices (int) relative to
+                    the sorted list of pkl files in self.pkl_path.
+        cycle_ids : list of 0-based cycle indices to plot for every selected cell.
+        v_min     : lower voltage cutoff (V) for dQ/dV computation.
+        v_max     : upper voltage cutoff (V) for dQ/dV computation.
+        """
+        pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
+        file_map = {}
+        for f in sorted(pkl_files):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            name = stem.replace("MATR_", "") if stem.startswith("MATR_") else stem
+            file_map[name] = f
+        all_names = sorted(file_map.keys())
+
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(all_names):
+                    resolved.append(all_names[cid])
+                else:
+                    print(f"Warning: index {cid} out of range (0..{len(all_names)-1}).")
+            else:
+                if cid in file_map:
+                    resolved.append(cid)
+                else:
+                    print(f"Warning: cell '{cid}' not found in pkl path.")
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        n_cells = len(resolved)
+        use_legend = len(cycle_ids) <= 8
+        cmap = plt.cm.plasma
+        norm = plt.Normalize(vmin=min(cycle_ids), vmax=max(cycle_ids))
+
+        n_cols = min(4, n_cells)
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, name in enumerate(resolved):
+            ax = flat_axes[i]
+            print(f"Loading cell '{name}' ...")
+            with open(file_map[name], 'rb') as f:
+                data = pickle.load(f)
+            cycle_data = data.get('cycle_data', [])
+            del data
+
+            for cyc_idx in cycle_ids:
+                if cyc_idx >= len(cycle_data) or not isinstance(cycle_data[cyc_idx], dict):
+                    print(f"  Cycle {cyc_idx} not available for cell '{name}'.")
+                    continue
+
+                item = cycle_data[cyc_idx]
+                voltage = np.asarray(item['voltage_in_V'])
+                capacity = np.asarray(item['discharge_capacity_in_Ah'])
+                current = np.asarray(item['current_in_A'])
+
+                mask = current < 0
+                result = self.calculate_dQdV(voltage[mask], capacity[mask], v_min=v_min, v_max=v_max)
+                if result is None:
+                    print(f"  dQ/dV could not be computed for cycle {cyc_idx} of cell '{name}'.")
+                    continue
+
+                color = cmap(norm(cyc_idx))
+                label = f"Cycle {cyc_idx}" if use_legend else "_nolegend_"
+                ax.plot(result["V_dQdV"], result["dQdV"], color=color, label=label,
+                        linewidth=1.2, alpha=0.85)
+
+            del cycle_data
+            gc.collect()
+
+            ax.set_xlabel("Voltage (V)")
+            ax.set_ylabel("dQ/dV (Ah/V)")
+            ax.set_title(f"dQ/dV — Cell {name}")
+            ax.grid(True, alpha=0.4)
+            if use_legend:
+                ax.legend(fontsize=8)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        if not use_legend:
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=flat_axes[:n_cells].tolist(), label="Cycle Index")
+
+        plt.suptitle("dQ/dV Curves — Selected Cells & Cycles", fontsize=13)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_dqdv_diff(self, cell_ids, ref_cycle=10, v_min=2.4, v_max=3.6,
+                       cycle_step=10, n_grid=500):
+        """
+        Plot dQ/dV(cycle) − dQ/dV(ref_cycle) for every selected cell (all cycles).
+
+        cell_ids   : list of cell names (str) or 0-based indices (int).
+        ref_cycle  : cycle index used as the reference (default 10).
+        v_min/max  : voltage window for dQ/dV computation.
+        cycle_step : plot every Nth cycle to reduce overplotting.
+        n_grid     : number of points in the shared voltage interpolation grid.
+        """
+        pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
+        file_map = {}
+        for f in sorted(pkl_files):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            name = stem.replace("MATR_", "") if stem.startswith("MATR_") else stem
+            file_map[name] = f
+        all_names = sorted(file_map.keys())
+
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(all_names):
+                    resolved.append(all_names[cid])
+                else:
+                    print(f"Warning: index {cid} out of range (0..{len(all_names)-1}).")
+            else:
+                if cid in file_map:
+                    resolved.append(cid)
+                else:
+                    print(f"Warning: cell '{cid}' not found in pkl path.")
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        V_grid = np.linspace(v_min, v_max, n_grid)
+
+        n_cells = len(resolved)
+        n_cols = min(4, n_cells)
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, name in enumerate(resolved):
+            ax = flat_axes[i]
+            print(f"Loading cell '{name}' ...")
+            with open(file_map[name], 'rb') as f:
+                data = pickle.load(f)
+            cycle_data = data.get('cycle_data', [])
+            del data
+
+            def _dqdv_on_grid(cyc_idx):
+                if cyc_idx >= len(cycle_data) or not isinstance(cycle_data[cyc_idx], dict):
+                    return None
+                item = cycle_data[cyc_idx]
+                voltage = np.asarray(item['voltage_in_V'])
+                capacity = np.asarray(item['discharge_capacity_in_Ah'])
+                current = np.asarray(item['current_in_A'])
+                mask = current < 0
+                result = self.calculate_dQdV(voltage[mask], capacity[mask], v_min=v_min, v_max=v_max)
+                if result is None:
+                    return None
+                interp = interp1d(result["V_dQdV"], result["dQdV"],
+                                  bounds_error=False, fill_value=0.0)
+                return interp(V_grid)
+
+            ref = _dqdv_on_grid(ref_cycle)
+            if ref is None:
+                print(f"  Reference cycle {ref_cycle} unavailable for cell '{name}', skipping.")
+                ax.set_visible(False)
+                del cycle_data
+                continue
+
+            n_total = len(cycle_data)
+            cmap = plt.cm.plasma
+            plot_norm = plt.Normalize(vmin=0, vmax=n_total)
+
+            for cyc_idx in range(0, n_total, cycle_step):
+                if cyc_idx == ref_cycle:
+                    continue
+                dqdv = _dqdv_on_grid(cyc_idx)
+                if dqdv is None:
+                    continue
+                ax.plot(dqdv - ref, V_grid, color=cmap(plot_norm(cyc_idx)),
+                        linewidth=0.8, alpha=0.7)
+
+            del cycle_data
+            gc.collect()
+
+            ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
+            ax.set_xlabel("ΔdQ/dV (Ah/V)")
+            ax.set_ylabel("Voltage (V)")
+            ax.set_title(f"ΔdQ/dV — Cell {name} (ref: cycle {ref_cycle})")
+            ax.grid(True, alpha=0.4)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        plt.suptitle(f"dQ/dV − dQ/dV(cycle {ref_cycle})", fontsize=13)
+        plt.tight_layout()
+        fig.subplots_adjust(right=0.88)
+
+        cax = fig.add_axes([0.91, 0.15, 0.02, 0.70])
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.plasma,
+                                   norm=plt.Normalize(vmin=0, vmax=1))
+        sm.set_array([])
+        fig.colorbar(sm, cax=cax, label="Cycle Index (relative)")
+
+        plt.show()
+
+
 if __name__ == "__main__":
     pkl_path = "/Users/ruturaj/Master-Thesis/Dataset/MIT"
     cache_path = r"processed_hust_MIT_cache.pkl"
@@ -337,3 +596,14 @@ if __name__ == "__main__":
     for i, cell in enumerate(cells_cache):
         print(f"Cell {cell['cell_name']}: features {cell['features'].shape}, "
               f"soh len {len(cell['soh'])}, eol {cell['eol']}")
+
+    # --- SoH: all cells ---
+    # processor.plot_soh_all(cells_cache, normalize=True)
+
+    # --- dQ/dV: selected cells and cycles ---
+    CELL_IDS  = [ "b0c29", "b0c44", "b0c45", "b0c35", "b0c36", "b1c3", "b1c41", "b1c42", "b1c43", "b1c44", "b2c34",
+    "b2c30", "b2c31", "b2c17", "b2c18", "b3c40", "b3c26", "b3c27"]          # cell names (str) or 0-based indices (int)
+    CYCLE_IDS = [1, 10, 50, 100, 150, 200, 250]  # 0-based cycle indices
+
+    processor.plot_dqdv_selected(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
+    processor.plot_dqdv_diff(cell_ids=["b2c34"], ref_cycle=10, cycle_step=50)
