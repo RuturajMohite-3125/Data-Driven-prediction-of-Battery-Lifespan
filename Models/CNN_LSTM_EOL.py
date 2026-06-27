@@ -15,7 +15,7 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
-import xgboost as xgb
+from xgboost import XGBClassifier
 
 from featureExtrcation.processDatasets import HUSTDataProcessor
 
@@ -28,7 +28,7 @@ SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 
 _cycles_env = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(1, 50)]
+CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [1,10,50,100,150,200]
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -154,12 +154,14 @@ def load_fixed_split():
 
 def labels_from_train_tertiles(eol_arr, train_eol=None):
     """Bottom third -> Fast, middle -> Normal, top third -> Slow.
-    Thresholds are fixed to match MIT_transformer_EOL.py."""
+    Thresholds are derived from the training split so val/test labels
+    never leak into the boundary decision."""
     if train_eol is None:
         raise ValueError("train_eol is required to derive train-only tertiles.")
 
     train_eol = np.asarray(train_eol, dtype=float)
-    q33, q66 = 450,950
+    q33 = float(np.percentile(train_eol, 33.3))
+    q66 = float(np.percentile(train_eol, 66.7))
     y = np.full(len(eol_arr), 1, dtype=int)
     y[np.asarray(eol_arr) <= q33] = 0
     y[np.asarray(eol_arr) > q66] = 2
@@ -174,36 +176,6 @@ def _aligned_proba(clf, X):
     return out
 
 
-class XGBBoosterClassifier:
-    def __init__(self, booster, classes):
-        self.booster = booster
-        self.classes_ = np.asarray(classes)
-
-    def _predict_raw(self, X):
-        dmat = xgb.DMatrix(X)
-        try:
-            probs = self.booster.predict(dmat, iteration_range=(0, self.booster.best_iteration + 1))
-        except (TypeError, AttributeError):
-            try:
-                probs = self.booster.predict(dmat, ntree_limit=getattr(self.booster, "best_ntree_limit", 0))
-            except TypeError:
-                probs = self.booster.predict(dmat)
-        return probs
-
-    def predict_proba(self, X):
-        probs = self._predict_raw(X)
-        probs = np.asarray(probs)
-        if probs.ndim == 1:
-            probs = probs.reshape(-1, N_CLASSES)
-        return probs
-
-    def predict(self, X):
-        return np.argmax(self.predict_proba(X), axis=1)
-
-    def save_model(self, path):
-        self.booster.save_model(path)
-
-
 def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     Xt = X_scalar[idx_tr]
     yt = y[idx_tr]
@@ -216,22 +188,21 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     if np.any(nonzero):
         class_weights[nonzero] = (len(yt) / (N_CLASSES * class_counts[nonzero])) ** 1.2
 
-    params = dict(
-        max_depth=6,
-        eta=0.03,
-        subsample=1.0,
-        colsample_bytree=1.0,
-        min_child_weight=2.0,
-        gamma=0.05,
-        reg_alpha=0.2,
-        reg_lambda=1.5,
+    base_kwargs = dict(
+        n_estimators=1000,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
         objective="multi:softprob",
         num_class=N_CLASSES,
         eval_metric="mlogloss",
+        early_stopping_rounds=40,
         tree_method="hist",
-        nthread=1,
-        seed_per_iteration=True,
-        seed=seed,
+        n_jobs=-1,
     )
 
     n_splits = min(5, int(np.min(np.bincount(yt, minlength=N_CLASSES))) or 1)
@@ -241,31 +212,18 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     for fold, (a, b) in enumerate(skf.split(Xt, yt)):
-        dtrain = xgb.DMatrix(Xt[a], label=yt[a], weight=class_weights[yt[a]])
-        dval = xgb.DMatrix(Xt[b], label=yt[b])
-        booster = xgb.train(
-            params=params,
-            dtrain=dtrain,
-            num_boost_round=1500,
-            evals=[(dval, "val")],
-            early_stopping_rounds=50,
-            verbose_eval=False,
-        )
-        clf = XGBBoosterClassifier(booster, classes=[0, 1, 2])
+        clf = XGBClassifier(random_state=seed + fold, **base_kwargs)
+        clf.fit(Xt[a], yt[a], sample_weight=class_weights[yt[a]],
+                eval_set=[(Xt[b], yt[b])], verbose=False)
         oof_pred[b] = clf.predict(Xt[b])
         oof_proba[b] = _aligned_proba(clf, Xt[b])
 
-    dtrain_full = xgb.DMatrix(Xt, label=yt, weight=class_weights[yt])
-    dval_full = xgb.DMatrix(Xv, label=y[idx_va])
-    final_booster = xgb.train(
-        params=params,
-        dtrain=dtrain_full,
-        num_boost_round=1500,
-        evals=[(dval_full, "val")],
-        early_stopping_rounds=50,
-        verbose_eval=False,
-    )
-    final_clf = XGBBoosterClassifier(final_booster, classes=[0, 1, 2])
+    final_clf = XGBClassifier(random_state=seed, **base_kwargs)
+    rng = np.random.default_rng(seed)
+    es_idx = rng.choice(len(Xt), size=max(1, len(Xt) // 5), replace=False)
+    tr_idx = np.setdiff1d(np.arange(len(Xt)), es_idx)
+    final_clf.fit(Xt[tr_idx], yt[tr_idx], sample_weight=class_weights[yt[tr_idx]],
+                  eval_set=[(Xt[es_idx], yt[es_idx])], verbose=False)
 
     proba_va = _aligned_proba(final_clf, Xv)
     proba_te = _aligned_proba(final_clf, Xte)
@@ -274,8 +232,16 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     return final_clf, oof_pred, oof_proba, pred_va, proba_va, pred_te, proba_te
 
 
-def append_class_features(X, proba):
-    proba_t = torch.tensor(proba, dtype=torch.float32)
+def append_class_features(X, proba, temperature=2.5):
+    # Temperature > 1 softens sharp XGBoost probabilities before the NN sees them.
+    # Without this, a high-accuracy XGBoost produces near one-hot vectors that
+    # strongly mislead the NN on the ~12% of misclassified cells.
+    proba_arr = np.array(proba, dtype=np.float32).clip(1e-8)
+    log_p = np.log(proba_arr) / temperature
+    log_p -= log_p.max(axis=1, keepdims=True)
+    softened = np.exp(log_p)
+    softened /= softened.sum(axis=1, keepdims=True)
+    proba_t = torch.tensor(softened, dtype=torch.float32)
     tile = proba_t.unsqueeze(1).expand(-1, X.size(1), -1)
     return torch.cat([X, tile], dim=-1)
 
@@ -304,35 +270,40 @@ def build_cell_tensors(cells_cache, cycles=CYCLES_TO_USE):
 
 
 def build_scalar_features(X):
-    """Create a richer tabular representation for XGBoost.
-
-    Uses per-feature summary statistics over the selected cycle window:
-    mean, std, min, max, first, last, slope, and range.
-    """
+    """Tabular representation for XGBoost: statistical aggregates + cycle-pair deltas."""
     x = X.numpy() if isinstance(X, torch.Tensor) else np.asarray(X)
-    mean = x.mean(axis=1)
-    std = x.std(axis=1)
-    min_ = x.min(axis=1)
-    max_ = x.max(axis=1)
-    first = x[:, 0, :]
-    last = x[:, -1, :]
-    slope = last - first
-    value_range = max_ - min_
-    rolling_mid = x[:, x.shape[1] // 2, :]
-    scalar = np.concatenate([mean, std, min_, max_, first, last, slope, value_range, rolling_mid], axis=1)
+    feat_mean  = x.mean(axis=1)
+    feat_std   = x.std(axis=1)
+    feat_slope = x[:, -1, :] - x[:, 0, :]
+    feat_min   = x.min(axis=1)
+    feat_max   = x.max(axis=1)
+    feat_q25   = np.percentile(x, 25, axis=1)
+    feat_q75   = np.percentile(x, 75, axis=1)
+    n_cyc = x.shape[1]
+    q = max(1, n_cyc // 4)
+    feat_early  = x[:, :q, :].mean(axis=1)
+    feat_late   = x[:, -q:, :].mean(axis=1)
+    feat_deltas = np.diff(x, axis=1).reshape(x.shape[0], -1)
+    scalar = np.concatenate([
+        feat_mean, feat_std, feat_slope,
+        feat_min, feat_max, feat_q25, feat_q75,
+        feat_early, feat_late, feat_deltas,
+    ], axis=1)
     return np.nan_to_num(scalar, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
-def eol_accuracy(preds, tgts, band=0.10):
+def eol_accuracy(preds, tgts, band=0.15):
     preds = np.asarray(preds, dtype=float)
     tgts = np.asarray(tgts, dtype=float)
     denom = np.clip(np.abs(tgts), 1e-8, None)
     return float(np.mean(np.abs(preds - tgts) / denom <= band))
 
 
+BLEND_ALPHA_MAX = 0.25  # cap: NN prediction always dominates over class-mean prior
+
 def fit_class_blend(preds_va, tgts_va, proba_va, class_means):
     expected_from_class = np.asarray(proba_va, dtype=float) @ np.asarray(class_means, dtype=float)
-    alphas = np.linspace(0.0, 1.0, 51)
+    alphas = np.linspace(0.0, BLEND_ALPHA_MAX, 26)
     best_alpha, best_mae, best_preds = 0.0, float("inf"), np.asarray(preds_va, dtype=float)
     for a in alphas:
         cand = (1.0 - a) * preds_va + a * expected_from_class

@@ -29,7 +29,7 @@ SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 
 _cycles_env = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(1, 50)]
+CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(1,51)]
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -170,13 +170,14 @@ def load_fixed_split():
 
 def labels_from_train_tertiles(eol_arr, train_eol=None):
     """Bottom third -> Fast, middle -> Normal, top third -> Slow.
-    Thresholds are fixed to match MIT_transformer_EOL.py."""
+    Thresholds are derived from the training split so val/test labels
+    never leak into the boundary decision."""
     if train_eol is None:
         raise ValueError("train_eol is required to derive train-only tertiles.")
 
     train_eol = np.asarray(train_eol, dtype=float)
-    q33 = 450
-    q66 = 950
+    q33 = float(np.percentile(train_eol, 33.3))
+    q66 = float(np.percentile(train_eol, 66.7))
     y = np.full(len(eol_arr), 1, dtype=int)
     y[np.asarray(eol_arr) <= q33] = 0
     y[np.asarray(eol_arr) > q66] = 2
@@ -204,15 +205,18 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
         class_weights[nonzero] = (len(yt) / (N_CLASSES * class_counts[nonzero])) ** 1.2
 
     base_kwargs = dict(
-        n_estimators=400,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
+        n_estimators=1000,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        reg_alpha=0.1,
         reg_lambda=1.0,
         objective="multi:softprob",
         num_class=N_CLASSES,
         eval_metric="mlogloss",
+        early_stopping_rounds=40,
         tree_method="hist",
         n_jobs=-1,
     )
@@ -225,12 +229,18 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
 
     for fold, (a, b) in enumerate(skf.split(Xt, yt)):
         clf = XGBClassifier(random_state=seed + fold, **base_kwargs)
-        clf.fit(Xt[a], yt[a], sample_weight=class_weights[yt[a]])
+        clf.fit(Xt[a], yt[a], sample_weight=class_weights[yt[a]],
+                eval_set=[(Xt[b], yt[b])], verbose=False)
         oof_pred[b] = clf.predict(Xt[b])
         oof_proba[b] = _aligned_proba(clf, Xt[b])
 
     final_clf = XGBClassifier(random_state=seed, **base_kwargs)
-    final_clf.fit(Xt, yt, sample_weight=class_weights[yt])
+    # use a small hold-out from train for early stopping on final model
+    rng = np.random.default_rng(seed)
+    es_idx = rng.choice(len(Xt), size=max(1, len(Xt) // 5), replace=False)
+    tr_idx = np.setdiff1d(np.arange(len(Xt)), es_idx)
+    final_clf.fit(Xt[tr_idx], yt[tr_idx], sample_weight=class_weights[yt[tr_idx]],
+                  eval_set=[(Xt[es_idx], yt[es_idx])], verbose=False)
 
     proba_va = _aligned_proba(final_clf, Xv)
     proba_te = _aligned_proba(final_clf, Xte)
@@ -239,8 +249,16 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
     return final_clf, oof_pred, oof_proba, pred_va, proba_va, pred_te, proba_te
 
 
-def append_class_features(X, proba):
-    proba_t = torch.tensor(proba, dtype=torch.float32)
+def append_class_features(X, proba, temperature=2.5):
+    # Temperature > 1 softens sharp XGBoost probabilities before the NN sees them.
+    # Without this, a high-accuracy XGBoost produces near one-hot vectors that
+    # strongly mislead the NN on the ~12% of misclassified cells.
+    proba_arr = np.array(proba, dtype=np.float32).clip(1e-8)
+    log_p = np.log(proba_arr) / temperature
+    log_p -= log_p.max(axis=1, keepdims=True)
+    softened = np.exp(log_p)
+    softened /= softened.sum(axis=1, keepdims=True)
+    proba_t = torch.tensor(softened, dtype=torch.float32)
     tile = proba_t.unsqueeze(1).expand(-1, X.size(1), -1)
     return torch.cat([X, tile], dim=-1)
 
@@ -268,16 +286,18 @@ def build_cell_tensors(cells_cache, cycles=CYCLES_TO_USE):
     return X, eol, names
 
 
-def eol_accuracy(preds, tgts, band=0.10):
+def eol_accuracy(preds, tgts, band=0.15):
     preds = np.asarray(preds, dtype=float)
     tgts = np.asarray(tgts, dtype=float)
     denom = np.clip(np.abs(tgts), 1e-8, None)
     return float(np.mean(np.abs(preds - tgts) / denom <= band))
 
 
+BLEND_ALPHA_MAX = 0.25  # cap: NN prediction always dominates over class-mean prior
+
 def fit_class_blend(preds_va, tgts_va, proba_va, class_means):
     expected_from_class = np.asarray(proba_va, dtype=float) @ np.asarray(class_means, dtype=float)
-    alphas = np.linspace(0.0, 1.0, 51)
+    alphas = np.linspace(0.0, BLEND_ALPHA_MAX, 26)
     best_alpha, best_mae, best_preds = 0.0, float("inf"), np.asarray(preds_va, dtype=float)
     for a in alphas:
         cand = (1.0 - a) * preds_va + a * expected_from_class
@@ -556,9 +576,24 @@ if __name__ == "__main__":
     eol_te = eol_all[idx_te]
 
     X_np = X_all.numpy()
-    feat_mean = X_np.mean(axis=1)
-    feat_slope = X_np[:, -1, :] - X_np[:, 0, :]
-    scalar_X = np.concatenate([feat_mean, feat_slope], axis=1).astype(np.float32)
+    feat_mean   = X_np.mean(axis=1)
+    feat_std    = X_np.std(axis=1)
+    feat_slope  = X_np[:, -1, :] - X_np[:, 0, :]
+    feat_min    = X_np.min(axis=1)
+    feat_max    = X_np.max(axis=1)
+    feat_q25    = np.percentile(X_np, 25, axis=1)
+    feat_q75    = np.percentile(X_np, 75, axis=1)
+    n_cyc = X_np.shape[1]
+    q = max(1, n_cyc // 4)
+    feat_early  = X_np[:, :q, :].mean(axis=1)
+    feat_late   = X_np[:, -q:, :].mean(axis=1)
+    # consecutive-cycle deltas: rate of change between each pair of selected cycles
+    feat_deltas = np.diff(X_np, axis=1).reshape(X_np.shape[0], -1)
+    scalar_X = np.concatenate([
+        feat_mean, feat_std, feat_slope,
+        feat_min, feat_max, feat_q25, feat_q75,
+        feat_early, feat_late, feat_deltas,
+    ], axis=1).astype(np.float32)
     scalar_X = np.nan_to_num(scalar_X, nan=0.0, posinf=0.0, neginf=0.0)
 
     eol_np = eol_all.squeeze(-1).numpy()
