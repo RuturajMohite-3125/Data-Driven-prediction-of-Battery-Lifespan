@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
+#SBATCH --partition=CHANGE_ME   # run: sinfo -o "%P %a %l" to see available partitions
+# #SBATCH --gres=gpu:1          # uncomment if the partition has GPUs
 
 # ── activate environment ──────────────────────────────────────────────────────
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
