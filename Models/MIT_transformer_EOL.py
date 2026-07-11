@@ -374,6 +374,54 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
     else:
         plt.close(fig)
 
+
+def plot_eol_splits(preds_tr, tgts_tr, preds_va, tgts_va, preds_te, tgts_te,
+                     title="Predicted vs True EOL — Train / Val / Test"):
+    def _metrics(tgts, preds):
+        tgts = np.asarray(tgts, dtype=float)
+        preds = np.asarray(preds, dtype=float)
+        mae = float(np.mean(np.abs(preds - tgts)))
+        rmse = float(np.sqrt(np.mean((preds - tgts) ** 2)))
+        ss_res = np.sum((preds - tgts) ** 2)
+        ss_tot = np.sum((tgts - np.mean(tgts)) ** 2)
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        return mae, rmse, r2
+
+    splits = [
+        ("Train", np.asarray(tgts_tr), np.asarray(preds_tr), "^", "#2a78d6"),
+        ("Val",   np.asarray(tgts_va), np.asarray(preds_va), "s", "#eda100"),
+        ("Test",  np.asarray(tgts_te), np.asarray(preds_te), "o", "#e34948"),
+    ]
+
+    all_tgts = np.concatenate([s[1] for s in splits])
+    all_preds = np.concatenate([s[2] for s in splits])
+    lo = min(all_tgts.min(), all_preds.min())
+    hi = max(all_tgts.max(), all_preds.max())
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1.5, alpha=0.7, label="Perfect prediction")
+
+    for label, tgts, preds, marker, color in splits:
+        mae, rmse, r2 = _metrics(tgts, preds)
+        ax.scatter(
+            tgts, preds, marker=marker, s=70, color=color,
+            edgecolors="white", linewidths=0.6, alpha=0.85,
+            label=f"{label} (MAE={mae:.1f}, RMSE={rmse:.1f}, R²={r2:.2f})",
+        )
+
+    ax.set_xlabel("True EOL (cycles)")
+    ax.set_ylabel("Predicted EOL (cycles)")
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+
+    plt.tight_layout()
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close(fig)
+
 def load_cache(cache_path=CACHE_PATH):
     if not os.path.exists(cache_path):
         print(f"{cache_path} not found — generating from raw pkl files...")
@@ -691,6 +739,7 @@ if __name__ == "__main__":
               f"{tc:>9} {pc:>9}  [{p[0]:.2f} {p[1]:.2f} {p[2]:.2f}]{flag}")
 
     plot_results(preds_te_blend, tgts_te, title="Model Evaluation on Test Set")
+    plot_eol_splits(preds_tr, tgts_tr, preds_va_blend, tgts_va, preds_te_blend, tgts_te)
 
     if SAVE_ARTIFACTS:
         ckpt_path = "best_eol_transformer_50_cycle_window.pt"
