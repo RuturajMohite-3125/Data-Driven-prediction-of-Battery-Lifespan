@@ -10,6 +10,7 @@ import gc
 import tqdm as tqdm
 import glob
 import os
+import string
 from scipy.stats import kurtosis, skew
 
 # Fixed output length for the SoH trajectory stored in the cache.
@@ -65,11 +66,14 @@ class HUSTDataProcessor:
         if deriv is not None:
             dQdV = deriv["dQdV"]
             dQdV_10 = deriv_10["dQdV"] if deriv_10 is not None else np.array([])
-            # dQdV_max = np.max(dQdV) - (np.max(dQdV_10) if len(dQdV_10) > 0 else 0)
-            dQdV_min = np.min(dQdV) - (np.min(dQdV_10) if len(dQdV_10) > 0 else 0)
-            dQdV_var = np.var(dQdV) - (np.var(dQdV_10) if len(dQdV_10) > 0 else 0)
+            ref_max = float(np.max(dQdV_10)) if len(dQdV_10) > 0 else 0.0
+            ref_min = float(np.min(dQdV_10)) if len(dQdV_10) > 0 else 0.0
+            ref_var = float(np.var(dQdV_10)) if len(dQdV_10) > 0 else 0.0
+            dQdV_max = float(np.max(dQdV)) - ref_max
+            dQdV_min = float(np.min(dQdV)) - ref_min
+            dQdV_var = float(np.var(dQdV)) - ref_var
         else:
-            dQdV_max = dQdV_min = dQdV_var = 0
+            dQdV_max = dQdV_min = dQdV_var = 0.0
 
         I_c = cycle_data['current_charge']
         V_c = cycle_data['voltage_charge']
@@ -79,23 +83,28 @@ class HUSTDataProcessor:
         Q_d = cycle_data['capacity_discharge']
 
         if all(len(a) > 0 for a in [I_c, V_c, Q_c, I_d, V_d, Q_d]):
-            log_std_I = float(20.0 * np.log10(np.std(I_c).clip(1e-9)))
-            log_std_qd = float(20.0 * np.log10(np.std(Q_c).clip(1e-9)))
-            log_std_V = float(20.0 * np.log10(np.std(V_c).clip(1e-9)))
-            log_std_Id = float(20.0 * np.log10(np.std(I_d).clip(1e-9)))
-            log_std_qd_d = float(20.0 * np.log10(np.std(Q_d).clip(1e-9)))
-            log_std_Vd = float(20.0 * np.log10(np.std(V_d).clip(1e-9)))
+            log_std_I    = float(20.0 * np.log10(np.std(I_c).clip(1e-9)))
+            log_std_qc   = float(20.0 * np.log10(np.std(Q_c).clip(1e-9)))
+            log_std_V    = float(20.0 * np.log10(np.std(V_c).clip(1e-9)))
+            log_std_Id   = float(20.0 * np.log10(np.std(I_d).clip(1e-9)))
+            log_std_qd   = float(20.0 * np.log10(np.std(Q_d).clip(1e-9)))
+            log_std_Vd   = float(20.0 * np.log10(np.std(V_d).clip(1e-9)))
+            max_Q_c      = float(np.max(Q_c))
+            max_Q_d      = float(np.max(Q_d))
+            coulombic_eff = max_Q_d / max(max_Q_c, 1e-9)
+            v_drop_start  = float(V_d[0] - V_d[-1]) if len(V_d) > 1 else 0.0
             return [
-                dQdV_min, dQdV_var,
-                log_std_I, log_std_qd, log_std_V,
-                log_std_Id, log_std_qd_d, log_std_Vd,
+                dQdV_max, dQdV_min, dQdV_var,
+                log_std_I, log_std_qc, log_std_V,
+                log_std_Id, log_std_qd, log_std_Vd,
                 float(np.min(I_c)), float(np.max(I_c)),
                 float(np.min(V_c)), float(np.max(V_c)),
                 float(np.min(I_d)), float(np.max(I_d)),
                 float(np.min(V_d)), float(np.max(V_d)),
-                float(np.max(Q_d)), float(kurtosis(V_d)),
+                max_Q_d, float(kurtosis(V_d)),
+                coulombic_eff, v_drop_start,
             ]
-        return [0] * 18
+        return [0] * 21
 
     def process_and_extract(self, cache_path=None):
         if cache_path and os.path.exists(cache_path):
@@ -175,24 +184,179 @@ class HUSTDataProcessor:
 
         return cells_cache
 
-    def plot_capacity_vs_voltage(self, processed_cells):
-        plt.figure(figsize=(10, 6))
-        cell_indices = [2,4]
-        cycles_indices = range(0, 10)
-        for idx, processed_data in enumerate(processed_cells):
-            if idx not in cell_indices:
-                continue
-            for item in processed_data:
-                if isinstance(item, dict):
-                    voltage_discharge = item.get('voltage_discharge')
-                    capacity_discharge = item.get('capacity_discharge')
+    def plot_discharge_capacity_vs_voltage(self, cell_ids, cycle_ids, max_pts=500):
+        """
+        Plot discharge capacity vs voltage for selected cells and cycles.
 
-                    # voltage_discharge = voltage_discharge[10:100]
-                    # capacity_discharge = capacity_discharge[10:100]
-                    
-                    plt.plot(voltage_discharge, capacity_discharge, alpha=0.5)
+        cell_ids  : list of cell names (str) or 0-based indices (int) relative to
+                    the sorted list of pkl files in self.pkl_path.
+        cycle_ids : list of 0-based cycle indices to plot for every selected cell.
+        max_pts   : max points per cycle before downsampling (default 500).
+
+        Each cell gets one subplot; cycles are coloured by index (plasma colormap).
+        """
+        pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
+        file_map = {}
+        for f in sorted(pkl_files):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            name = stem.replace("MATR_", "") if stem.startswith("MATR_") else stem
+            file_map[name] = f
+        all_names = sorted(file_map.keys())
+
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(all_names):
+                    resolved.append(all_names[cid])
                 else:
-                    print("Expected a dict in cycle_data, but got:", type(item))
+                    print(f"Warning: index {cid} out of range (0..{len(all_names)-1}).")
+            else:
+                if cid in file_map:
+                    resolved.append(cid)
+                else:
+                    print(f"Warning: cell '{cid}' not found in pkl path.")
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        use_legend = len(cycle_ids) <= 8
+        cmap = plt.cm.plasma
+        norm = plt.Normalize(vmin=min(cycle_ids), vmax=max(cycle_ids))
+
+        n_cells = len(resolved)
+        n_cols = min(4, n_cells)
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, name in enumerate(resolved):
+            ax = flat_axes[i]
+            print(f"Loading cell '{name}' ...")
+            with open(file_map[name], 'rb') as f:
+                data = pickle.load(f)
+            cycle_data = data.get('cycle_data', [])
+            del data
+
+            for cyc_idx in cycle_ids:
+                if cyc_idx >= len(cycle_data) or not isinstance(cycle_data[cyc_idx], dict):
+                    print(f"  Cycle {cyc_idx} not available for cell '{name}'.")
+                    continue
+
+                item = cycle_data[cyc_idx]
+                voltage  = np.asarray(item['voltage_in_V'])
+                current  = np.asarray(item['current_in_A'])
+                cap_d    = np.asarray(item['discharge_capacity_in_Ah'])
+
+                idx = np.where(current < 0)[0]
+                if len(idx) == 0:
+                    continue
+                if len(idx) > max_pts:
+                    idx = idx[np.linspace(0, len(idx) - 1, max_pts, dtype=int)]
+
+                color = cmap(norm(cyc_idx))
+                label = f"Cycle {cyc_idx}" if use_legend else "_nolegend_"
+                ax.plot(voltage[idx], cap_d[idx], color=color, linewidth=1.2,
+                        alpha=0.85, label=label)
+
+            del cycle_data
+            gc.collect()
+
+            ax.set_xlabel("Voltage (V)")
+            ax.set_ylabel("Discharge Capacity (Ah)")
+            ax.set_title(f"Discharge Capacity vs Voltage — Cell {name}")
+            ax.grid(True, alpha=0.4)
+            if use_legend:
+                ax.legend(fontsize=8)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        if not use_legend:
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=flat_axes[:n_cells].tolist(), label="Cycle Index")
+
+        plt.suptitle("Discharge Capacity vs Voltage — Selected Cells & Cycles", fontsize=13)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_voltage_kurtosis(self, cells_cache, cell_ids):
+        """
+        Plot discharge-voltage kurtosis vs cycle index in a grid, one subplot
+        per selected cell, across all of each cell's cycles.
+
+        cells_cache : list of cell dicts as returned by process_and_extract().
+        cell_ids    : list of cell names (str) or 0-based indices (int) into
+                      cells_cache.
+
+        Points are coloured by cycle index; a single colorbar (scaled
+        0..max EOL among the selected cells) is placed outside the grid on
+        the right. Grid has a fixed 4 columns.
+        """
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(cells_cache):
+                    resolved.append(cells_cache[cid])
+                else:
+                    print(f"Warning: index {cid} out of range (0..{len(cells_cache)-1}).")
+            else:
+                cell = next((c for c in cells_cache if c['cell_name'] == cid), None)
+                if cell is None:
+                    print(f"Warning: cell '{cid}' not found in cells_cache.")
+                else:
+                    resolved.append(cell)
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        kurtosis_idx = 18
+        cmap = plt.cm.viridis
+        max_eol = max(c['eol'] for c in resolved)
+        norm = plt.Normalize(vmin=0, vmax=max(max_eol, 1))
+
+        n_cells = len(resolved)
+        n_cols = 4
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, cell in enumerate(resolved):
+            ax = flat_axes[i]
+            features = cell['features']
+            eol = cell['eol']
+            name = cell['cell_name']
+
+            n_cycles = min(features.shape[0], eol) if eol > 0 else features.shape[0]
+            if n_cycles == 0:
+                ax.set_visible(False)
+                continue
+
+            cycles = np.arange(n_cycles)
+            values = features[:n_cycles, kurtosis_idx]
+
+            ax.scatter(cycles, values, c=cycles, cmap=cmap, norm=norm, s=8, alpha=0.85)
+            ax.set_xlabel("Cycle Index")
+            ax.set_ylabel("Kurtosis")
+            ax.set_title(f"{name} (EOL: {eol})")
+            ax.grid(True, alpha=0.4)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        plt.suptitle("Discharge Voltage Kurtosis vs Cycle - Selected Cells", fontsize=13)
+        plt.tight_layout(rect=[0, 0, 0.9, 0.95])
+
+        cax = fig.add_axes([0.92, 0.15, 0.015, 0.70])
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=cax, label="Cycle Index (cell cycle life)")
+        cbar.set_ticks([0, int(norm.vmax)])
+        cbar.ax.set_yticklabels([f"{int(t)}" for t in cbar.get_ticks()])
+
+        plt.show()
 
     def calculate_dQdV(self, voltage, capacity, v_min=None, v_max=None):
         voltage = np.array(voltage)
@@ -358,10 +522,17 @@ class HUSTDataProcessor:
 
         for cell in cells_cache:
             soh = cell['soh'].copy()
-            if np.max(soh) < 0.88:
+            peak = np.max(soh)
+            if peak < 1e-8:
                 continue
-            if normalize and np.max(soh) > 1e-8:
-                soh = soh / np.max(soh)
+            # Outlier guard: a healthy cell should reach ~peak capacity early on.
+            # If the normalized capacity never gets above 0.9 within the first
+            # 10 cycles, treat the cell as bad data and drop it.
+            start_window = soh[:10] / peak
+            if np.max(start_window) < 0.9:
+                continue
+            if normalize:
+                soh = soh / peak
             # Savitzky-Golay: window must be odd and < len(soh)
             wl = min(51, len(soh) if len(soh) % 2 == 1 else len(soh) - 1)
             if wl >= 5:
@@ -377,6 +548,139 @@ class HUSTDataProcessor:
         ax.set_ylabel("Normalized Capacity (SoH)" if normalize else "Discharge Capacity (Ah)")
         ax.set_title(f"State of Health — All Cells ({len(cells_cache)} total)")
         ax.grid(True, alpha=0.4)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_log_dispersion_features(self, cells_cache, cell_id):
+        """
+        Plot the log-dispersion features (log_std_I, log_std_qc, log_std_V,
+        log_std_Id, log_std_qd, log_std_Vd) vs cycle index for a single cell,
+        across all of its cycles, laid out in a grid (one subplot per feature).
+
+        cells_cache : list of cell dicts as returned by process_and_extract().
+        cell_id     : cell name (str) or 0-based index (int) into cells_cache.
+
+        Points are coloured by cycle index, with a colorbar scaled to the
+        cell's own cycle life (0..EOL).
+        """
+        if isinstance(cell_id, int):
+            if not (0 <= cell_id < len(cells_cache)):
+                print(f"Warning: index {cell_id} out of range (0..{len(cells_cache)-1}).")
+                return
+            cell = cells_cache[cell_id]
+        else:
+            cell = next((c for c in cells_cache if c['cell_name'] == cell_id), None)
+            if cell is None:
+                print(f"Warning: cell '{cell_id}' not found in cells_cache.")
+                return
+
+        features = cell['features']
+        eol = cell['eol']
+        name = cell['cell_name']
+
+        feature_names = ['log_std_I', 'log_std_qc', 'log_std_V',
+                          'log_std_Id', 'log_std_qd', 'log_std_Vd']
+        feature_idx = [3, 4, 5, 6, 7, 8]
+
+        n_cycles = min(features.shape[0], eol) if eol > 0 else features.shape[0]
+        if n_cycles == 0:
+            print(f"No cycles available for cell '{name}'.")
+            return
+        cycles = np.arange(n_cycles)
+
+        cmap = plt.cm.viridis
+        norm = plt.Normalize(vmin=0, vmax=max(eol, 1))
+
+        n_cols = 3
+        n_rows = int(np.ceil(len(feature_names) / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        panel_labels = string.ascii_lowercase
+
+        for i, (fname, fidx) in enumerate(zip(feature_names, feature_idx)):
+            ax = flat_axes[i]
+            values = features[:n_cycles, fidx]
+            ax.scatter(cycles, values, c=cycles, cmap=cmap, norm=norm, s=10, alpha=0.85)
+            ax.set_xlabel("Cycle Index")
+            ax.set_ylabel(f"{fname} (dB)")
+            ax.set_title(f"({panel_labels[i]}) {fname}")
+            ax.grid(True, alpha=0.4)
+
+        for j in range(len(feature_names), len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        plt.suptitle(f"Log-Dispersion Features vs Cycle — Cell {name} (EOL: {eol})", fontsize=13)
+        plt.tight_layout()
+        fig.subplots_adjust(right=0.88)
+
+        cax = fig.add_axes([0.91, 0.15, 0.02, 0.70])
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=cax, label="Cycle Index (cell cycle life)")
+        cmin, cmax = int(cycles.min()), int(cycles.max())
+        cbar.set_ticks(sorted({0, cmin, cmax, int(norm.vmax)}))
+        cbar.ax.set_yticklabels([f"{int(t)}" for t in cbar.get_ticks()])
+
+        plt.show()
+
+    def plot_feature_eol_correlation(self, cells_cache, early_cycles=100):
+        """
+        Correlate per-cell engineered features (averaged over each cell's
+        first `early_cycles` cycles) with EOL, and plot the resulting
+        correlation matrix as a lower-triangular heatmap.
+
+        cells_cache  : list of cell dicts as returned by process_and_extract().
+        early_cycles : number of initial cycles averaged per cell to build the
+                       per-cell feature vector (default 100).
+        """
+        feature_names = [
+            'dQdV_max', 'dQdV_min', 'dQdV_var',
+            'log_std_I', 'log_std_qc', 'log_std_V',
+            'log_std_Id', 'log_std_qd', 'log_std_Vd',
+            'min_I_c', 'max_I_c', 'min_V_c', 'max_V_c',
+            'min_I_d', 'max_I_d', 'min_V_d', 'max_V_d',
+            'max_Q_d', 'kurtosis_Vd', 'coulombic_eff', 'v_drop_start',
+        ]
+
+        rows = []
+        for cell in cells_cache:
+            features = cell['features']
+            eol = cell['eol']
+            n = min(early_cycles, features.shape[0])
+            if n == 0:
+                continue
+            mean_feats = features[:n, :len(feature_names)].mean(axis=0)
+            rows.append(list(mean_feats) + [eol])
+
+        if not rows:
+            print("No cells available to compute correlation.")
+            return
+
+        df = pd.DataFrame(rows, columns=feature_names + ['EOL'])
+        corr = df.corr()
+
+        labels = corr.columns.tolist()
+        upper_mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+        corr_masked = np.ma.array(corr.to_numpy(), mask=upper_mask)
+
+        fig, ax = plt.subplots(figsize=(10, 9))
+        im = ax.imshow(corr_masked, cmap='coolwarm', vmin=-1, vmax=1)
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=90, fontsize=8)
+        ax.set_yticklabels(labels, fontsize=8)
+
+        for i in range(len(labels)):
+            for j in range(i + 1):
+                val = corr.iloc[i, j]
+                ax.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=6,
+                        color='white' if abs(val) > 0.6 else 'black')
+
+        fig.colorbar(im, ax=ax, label="Pearson Correlation", fraction=0.046, pad=0.04)
+        ax.set_title(f"Feature Correlation with EOL (mean of first {early_cycles} cycles)",
+                     fontsize=12)
         plt.tight_layout()
         plt.show()
 
@@ -474,6 +778,229 @@ class HUSTDataProcessor:
 
         plt.suptitle("dQ/dV Curves — Selected Cells & Cycles", fontsize=13)
         plt.tight_layout()
+        plt.show()
+
+    def plot_current_profile(self, cell_ids, cycle_ids):
+        """
+        Plot charge and discharge current profiles for selected cells and cycles.
+
+        cell_ids  : list of cell names (str) or 0-based indices (int) relative to
+                    the sorted list of pkl files in self.pkl_path.
+        cycle_ids : list of 0-based cycle indices to plot for every selected cell.
+
+        Each cell gets one subplot. Within a subplot, cycles are coloured by index
+        (plasma colormap). Charge phase (I > 0) is plotted solid, discharge (I < 0)
+        is plotted dashed, both in the same cycle colour so phases are visually
+        distinguishable but cycle progression is still clear.
+        """
+        pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
+        file_map = {}
+        for f in sorted(pkl_files):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            name = stem.replace("MATR_", "") if stem.startswith("MATR_") else stem
+            file_map[name] = f
+        all_names = sorted(file_map.keys())
+
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(all_names):
+                    resolved.append(all_names[cid])
+                else:
+                    print(f"Warning: index {cid} out of range (0..{len(all_names)-1}).")
+            else:
+                if cid in file_map:
+                    resolved.append(cid)
+                else:
+                    print(f"Warning: cell '{cid}' not found in pkl path.")
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        use_legend = len(cycle_ids) <= 8
+        cmap = plt.cm.plasma
+        norm = plt.Normalize(vmin=min(cycle_ids), vmax=max(cycle_ids))
+
+        n_cells = len(resolved)
+        n_cols = min(4, n_cells)
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, name in enumerate(resolved):
+            ax = flat_axes[i]
+            print(f"Loading cell '{name}' ...")
+            with open(file_map[name], 'rb') as f:
+                data = pickle.load(f)
+            cycle_data = data.get('cycle_data', [])
+            del data
+
+            for cyc_idx in cycle_ids:
+                if cyc_idx >= len(cycle_data) or not isinstance(cycle_data[cyc_idx], dict):
+                    print(f"  Cycle {cyc_idx} not available for cell '{name}'.")
+                    continue
+
+                item = cycle_data[cyc_idx]
+                current = np.asarray(item['current_in_A'])
+                samples = np.arange(len(current))
+
+                color = cmap(norm(cyc_idx))
+                label = f"Cycle {cyc_idx}" if use_legend else "_nolegend_"
+
+                charge_mask    = current >= 0
+                discharge_mask = current <  0
+
+                if charge_mask.any():
+                    ax.plot(samples[charge_mask], current[charge_mask],
+                            color=color, linestyle='-', linewidth=1.0,
+                            alpha=0.85, label=label)
+                    label = "_nolegend_"
+                if discharge_mask.any():
+                    ax.plot(samples[discharge_mask], current[discharge_mask],
+                            color=color, linestyle='--', linewidth=1.0,
+                            alpha=0.85, label=label)
+
+            del cycle_data
+            gc.collect()
+
+            ax.axhline(0, color='black', linewidth=0.6, linestyle=':')
+            ax.set_xlabel("Sample Index")
+            ax.set_ylabel("Current (A)")
+            ax.set_title(f"Current Profile — Cell {name}")
+            ax.grid(True, alpha=0.4)
+            if use_legend:
+                ax.legend(fontsize=8)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        if not use_legend:
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=flat_axes[:n_cells].tolist(), label="Cycle Index")
+
+        # shared legend patch for line style
+        from matplotlib.lines import Line2D
+        style_handles = [
+            Line2D([0], [0], color='gray', linestyle='-',  linewidth=1.2, label='Charge (I ≥ 0)'),
+            Line2D([0], [0], color='gray', linestyle='--', linewidth=1.2, label='Discharge (I < 0)'),
+        ]
+        fig.legend(handles=style_handles, loc='lower center', ncol=2,
+                   fontsize=9, frameon=True, bbox_to_anchor=(0.5, 0.0))
+
+        plt.suptitle("Charge / Discharge Current — Selected Cells & Cycles", fontsize=13)
+        plt.tight_layout(rect=[0, 0.04, 1, 1])
+        plt.show()
+
+    def plot_voltage_profile(self, cell_ids, cycle_ids):
+        """
+        Plot charge and discharge voltage profiles for selected cells and cycles.
+
+        cell_ids  : list of cell names (str) or 0-based indices (int) relative to
+                    the sorted list of pkl files in self.pkl_path.
+        cycle_ids : list of 0-based cycle indices to plot for every selected cell.
+
+        Each cell gets one subplot. Charge phase (I > 0) is plotted solid,
+        discharge (I < 0) dashed, both in the same cycle colour.
+        """
+        pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
+        file_map = {}
+        for f in sorted(pkl_files):
+            stem = os.path.splitext(os.path.basename(f))[0]
+            name = stem.replace("MATR_", "") if stem.startswith("MATR_") else stem
+            file_map[name] = f
+        all_names = sorted(file_map.keys())
+
+        resolved = []
+        for cid in cell_ids:
+            if isinstance(cid, int):
+                if 0 <= cid < len(all_names):
+                    resolved.append(all_names[cid])
+                else:
+                    print(f"Warning: index {cid} out of range (0..{len(all_names)-1}).")
+            else:
+                if cid in file_map:
+                    resolved.append(cid)
+                else:
+                    print(f"Warning: cell '{cid}' not found in pkl path.")
+
+        if not resolved:
+            print("No valid cells selected.")
+            return
+
+        use_legend = len(cycle_ids) <= 8
+        cmap = plt.cm.plasma
+        norm = plt.Normalize(vmin=min(cycle_ids), vmax=max(cycle_ids))
+
+        n_cells = len(resolved)
+        n_cols = min(4, n_cells)
+        n_rows = int(np.ceil(n_cells / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+        flat_axes = axes.flatten()
+
+        for i, name in enumerate(resolved):
+            ax = flat_axes[i]
+            print(f"Loading cell '{name}' ...")
+            with open(file_map[name], 'rb') as f:
+                data = pickle.load(f)
+            cycle_data = data.get('cycle_data', [])
+            del data
+
+            for cyc_idx in cycle_ids:
+                if cyc_idx >= len(cycle_data) or not isinstance(cycle_data[cyc_idx], dict):
+                    print(f"  Cycle {cyc_idx} not available for cell '{name}'.")
+                    continue
+
+                item = cycle_data[cyc_idx]
+                voltage = np.asarray(item['voltage_in_V'])
+                current = np.asarray(item['current_in_A'])
+                samples = np.arange(len(voltage))
+
+                color = cmap(norm(cyc_idx))
+                label = f"Cycle {cyc_idx}" if use_legend else "_nolegend_"
+
+                charge_mask    = current > 0
+                discharge_mask = current < 0
+
+                if charge_mask.any():
+                    ax.plot(samples[charge_mask], voltage[charge_mask],
+                            color=color, linestyle='-', linewidth=1.0,
+                            alpha=0.85, label=label)
+                    label = "_nolegend_"
+                if discharge_mask.any():
+                    ax.plot(samples[discharge_mask], voltage[discharge_mask],
+                            color=color, linestyle='--', linewidth=1.0,
+                            alpha=0.85, label=label)
+
+            del cycle_data
+            gc.collect()
+
+            ax.set_xlabel("Sample Index")
+            ax.set_ylabel("Voltage (V)")
+            ax.set_title(f"Voltage Profile — Cell {name}")
+            ax.grid(True, alpha=0.4)
+            if use_legend:
+                ax.legend(fontsize=8)
+
+        for j in range(n_cells, len(flat_axes)):
+            flat_axes[j].set_visible(False)
+
+        if not use_legend:
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            fig.colorbar(sm, ax=flat_axes[:n_cells].tolist(), label="Cycle Index")
+
+        from matplotlib.lines import Line2D
+        style_handles = [
+            Line2D([0], [0], color='gray', linestyle='-',  linewidth=1.2, label='Charge (I > 0)'),
+            Line2D([0], [0], color='gray', linestyle='--', linewidth=1.2, label='Discharge (I < 0)'),
+        ]
+        fig.legend(handles=style_handles, loc='lower center', ncol=2,
+                   fontsize=9, frameon=True, bbox_to_anchor=(0.5, 0.0))
+
+        plt.suptitle("Charge / Discharge Voltage — Selected Cells & Cycles", fontsize=13)
+        plt.tight_layout(rect=[0, 0.04, 1, 1])
         plt.show()
 
     def plot_dqdv_diff(self, cell_ids, ref_cycle=10, v_min=2.4, v_max=3.6,
@@ -598,12 +1125,18 @@ if __name__ == "__main__":
               f"soh len {len(cell['soh'])}, eol {cell['eol']}")
 
     # --- SoH: all cells ---
-    # processor.plot_soh_all(cells_cache, normalize=True)
+    #processor.plot_soh_all(cells_cache, normalize=True)
 
     # --- dQ/dV: selected cells and cycles ---
     CELL_IDS  = [ "b0c29", "b0c44", "b0c45", "b0c35", "b0c36", "b1c3", "b1c41", "b1c42", "b1c43", "b1c44", "b2c34",
     "b2c30", "b2c31", "b2c17", "b2c18", "b3c40", "b3c26", "b3c27"]          # cell names (str) or 0-based indices (int)
-    CYCLE_IDS = [1, 10, 50, 100, 150, 200, 250]  # 0-based cycle indices
+    CYCLE_IDS = list(range(1, 250))  # 0-based cycle indices
 
-    processor.plot_dqdv_selected(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
-    processor.plot_dqdv_diff(cell_ids=["b2c34"], ref_cycle=10, cycle_step=50)
+    #processor.plot_dqdv_selected(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
+    #processor.plot_current_profile(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
+    #processor.plot_discharge_capacity_vs_voltage(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
+    #processor.plot_voltage_kurtosis(cells_cache=cells_cache, cell_ids=CELL_IDS)
+    #processor.plot_dqdv_diff(cell_ids=["b2c34"], ref_cycle=10, cycle_step=50)
+    #processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
+    #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
+    processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
