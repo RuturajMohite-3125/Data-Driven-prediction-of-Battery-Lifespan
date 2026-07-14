@@ -1,8 +1,4 @@
-"""
-Transformer with self-attention for EOL prediction.
 
-Uses pre-extracted cycle features from processDatasets.py / processed_hust_MIT_cache.pkl.
-"""
 import json
 import pickle
 import os
@@ -44,7 +40,6 @@ else:
 SHOW_PLOTS = os.environ.get("EOL_SHOW_PLOTS", "1") == "1"
 SAVE_ARTIFACTS = os.environ.get("EOL_SAVE_ARTIFACTS", "1") == "1"
 
-# Model/train hyperparams — overridable by sweep runner via env vars
 _CFG_D_MODEL      = int(os.environ.get("EOL_D_MODEL",      "64"))
 _CFG_NHEAD        = int(os.environ.get("EOL_NHEAD",        "4"))
 _CFG_NUM_LAYERS   = int(os.environ.get("EOL_NUM_LAYERS",   "2"))
@@ -76,7 +71,6 @@ class PositionalEncoding(nn.Module):
 
 
 class EOLTransformer(nn.Module):
-    """Encoder-only transformer with self-attention; CLS token pools to EOL scalar."""
 
     def __init__(self, num_features: int, d_model: int = 64, nhead: int = 4,
                  num_layers: int = 2, dim_ff: int = 128, dropout: float = 0.3,
@@ -121,9 +115,7 @@ def eol_accuracy(preds, tgts, band=0.15):
 
 def train_model(X_train, y_train, X_val, y_val,
                 epochs=None, batch_size=None, lr=None, weight_decay=None, lambda_eol=None):
-    """Same training loop as the original — only the data-splitting layer
-    moved out so we can honour cell_split.json."""
-    # fall back to module-level config (which reads from env vars set by sweep runner)
+   
     if epochs      is None: epochs      = _CFG_EPOCHS
     if batch_size  is None: batch_size  = _CFG_BATCH_SIZE
     if lr          is None: lr          = _CFG_LR
@@ -136,7 +128,7 @@ def train_model(X_train, y_train, X_val, y_val,
     y_val   = y_val.float().squeeze(-1)
 
 
-    # standardise target using TRAIN stats only
+    
     y_mean, y_std = y_train.mean().item(), y_train.std().item() + 1e-8
     y_train_n = (y_train - y_mean) / y_std
     y_val_n   = (y_val   - y_mean) / y_std
@@ -265,12 +257,12 @@ def evaluate(model, loader, y_mean, y_std, split_name="Test"):
 
     eol_acc_10 = eol_accuracy(preds, tgts)
     loss = loss_sum / max(1, n)
-    # R^2 score
+   
     ss_res = np.sum((preds - tgts) ** 2)
     ss_tot = np.sum((tgts - np.mean(tgts)) ** 2)
     r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Print concise stage-2 metrics for parsing by external runner
+    
     print(f"[Stage 2] {split_name} accuracy: {eol_acc_10 * 100:.2f}%")
     print(
         f"[Stage 2] {split_name} metrics: MAE={mae:.2f}, MAE%={mae_pct:.2f}, "
@@ -291,7 +283,8 @@ def make_eval_loader(X, y, y_mean, y_std, batch_size=8):
     """Create a DataLoader for evaluation: normalise target using train stats."""
     y_norm = (y.squeeze(-1) - y_mean) / y_std
     return DataLoader(TensorDataset(X, y_norm), batch_size=batch_size)
-BLEND_ALPHA_MAX = 0.25  # cap: NN prediction always dominates over class-mean prior
+
+BLEND_ALPHA_MAX = 0.25  
 
 def fit_class_blend(preds_va, tgts_va, proba_va, class_means):
     """Find alpha in [0, BLEND_ALPHA_MAX] that minimises validation MAE for:
@@ -320,7 +313,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(title, fontsize=16, fontweight="bold")
 
-    # top-left: predictions vs ground truth
+    
     ax = axes[0, 0]
     lo = min(tgts.min(), preds.min())
     hi = max(tgts.max(), preds.max())
@@ -333,7 +326,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
     ax.set_title("Predictions vs Ground Truth")
     ax.legend(); ax.grid(alpha=0.3)
 
-    # top-right: error distribution histogram
+    
     ax = axes[0, 1]
     ax.hist(errors, bins=20, edgecolor="white", alpha=0.8)
     ax.axvline(mae, color="red", ls="--", lw=1.5, label=f"MAE: {mae:.1f}")
@@ -343,7 +336,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
     ax.set_title("Error Distribution")
     ax.legend(); ax.grid(alpha=0.3)
 
-    # bottom-left: residuals vs ground truth
+    
     ax = axes[1, 0]
     ax.scatter(tgts, residuals, alpha=0.6, edgecolors="none")
     ax.axhline(0, color="black", lw=1)
@@ -354,7 +347,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
     ax.set_title("Residuals vs Ground Truth")
     ax.grid(alpha=0.3)
 
-    # bottom-right: cumulative error distribution
+    
     ax = axes[1, 1]
     sorted_err = np.sort(errors)
     cumul = np.arange(1, len(sorted_err) + 1) / len(sorted_err) * 100

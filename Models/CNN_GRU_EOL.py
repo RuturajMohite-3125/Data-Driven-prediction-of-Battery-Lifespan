@@ -1,8 +1,3 @@
-"""
-CNN/GRU EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
-feature cache, fixed cell_split.json split, and the same XGBoost aging-class
-stage used by MIT_transformer_EOL.py.
-"""
 
 import json
 import math
@@ -250,9 +245,6 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
 
 
 def append_class_features(X, proba, temperature=2.5):
-    # Temperature > 1 softens sharp XGBoost probabilities before the NN sees them.
-    # Without this, a high-accuracy XGBoost produces near one-hot vectors that
-    # strongly mislead the NN on the ~12% of misclassified cells.
     proba_arr = np.array(proba, dtype=np.float32).clip(1e-8)
     log_p = np.log(proba_arr) / temperature
     log_p -= log_p.max(axis=1, keepdims=True)
@@ -293,7 +285,7 @@ def eol_accuracy(preds, tgts, band=0.10):
     return float(np.mean(np.abs(preds - tgts) / denom <= band))
 
 
-BLEND_ALPHA_MAX = 0.25  # cap: NN prediction always dominates over class-mean prior
+BLEND_ALPHA_MAX = 0.25 
 
 def fit_class_blend(preds_va, tgts_va, proba_va, class_means):
     expected_from_class = np.asarray(proba_va, dtype=float) @ np.asarray(class_means, dtype=float)

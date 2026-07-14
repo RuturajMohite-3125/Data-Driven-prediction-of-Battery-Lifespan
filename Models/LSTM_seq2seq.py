@@ -1,8 +1,3 @@
-"""
-LSTM-based EOL prediction pipeline adapted to the processed_hust_MIT_cache.pkl
-feature cache, fixed cell_split.json split, and the same XGBoost aging-class
-stage used by MIT_transformer_EOL.py.
-"""
 
 import json
 import math
