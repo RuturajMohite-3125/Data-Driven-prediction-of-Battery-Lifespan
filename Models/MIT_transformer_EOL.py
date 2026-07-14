@@ -25,7 +25,7 @@ SPLIT_FILE = os.path.join(_HERE, "cell_split.json")
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 _raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()] or [1, 10, 50, 100, 150, 200, 250]
+CYCLES_TO_USE = [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()] or [*range(1,51), *range(100, 151), *range(200, 251)]
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -376,7 +376,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
 
 
 def plot_eol_splits(preds_tr, tgts_tr, preds_va, tgts_va, preds_te, tgts_te,
-                     title="Predicted vs True EOL — Train / Val / Test"):
+                     title="Transformer: Predicted vs True EOL - Train / Val / Test"):
     def _metrics(tgts, preds):
         tgts = np.asarray(tgts, dtype=float)
         preds = np.asarray(preds, dtype=float)

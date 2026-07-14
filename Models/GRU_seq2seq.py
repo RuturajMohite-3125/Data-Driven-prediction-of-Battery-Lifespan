@@ -31,7 +31,7 @@ _raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
 CYCLES_TO_USE = (
     [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()]
     if _raw_cycles.strip()
-    else [1, 10, 50, 100, 150, 200, 250]
+    else [1,10,50,100,150,200,250]
 )
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3

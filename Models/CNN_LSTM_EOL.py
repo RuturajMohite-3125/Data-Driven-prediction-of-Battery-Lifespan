@@ -28,7 +28,7 @@ SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 
 _cycles_env = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [1,10,50,100,150,200]
+CYCLES_TO_USE = [int(c) for c in _cycles_env.split(",") if c.strip()] if _cycles_env else [*range(10,41), *range(180,201)]
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -380,7 +380,7 @@ def plot_results(preds, tgts, title="Model Evaluation on Test Set"):
 
 
 def plot_eol_splits(preds_tr, tgts_tr, preds_va, tgts_va, preds_te, tgts_te,
-                     title="Predicted vs True EOL — Train / Val / Test"):
+                     title="CNN-LSTM: Predicted vs True EOL - Train / Val / Test"):
     def _metrics(tgts, preds):
         tgts = np.asarray(tgts, dtype=float)
         preds = np.asarray(preds, dtype=float)
