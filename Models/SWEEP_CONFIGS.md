@@ -1,6 +1,6 @@
 # Sweep Configuration Reference
 
-Config sweeps for three model families — **Transformer**, **GRU**, and **LSTM** — each run across **6 cycle windows × 5 configs × 10 seeds**.
+Config sweeps for five model families — **Transformer**, **GRU**, **LSTM**, **CNN-GRU**, and **CNN-LSTM** — each run across **6 cycle windows × 5 configs × 10 seeds**.
 
 ---
 
@@ -179,6 +179,114 @@ loss=l1, scheduler=cosine
 
 ---
 
+## CNN-GRU Configs (`run_cnn_gru_config_sweep.py`)
+
+The CNN-GRU prepends a 1-D convolutional encoder (two conv blocks, channel count doubling to `cnn_channels*2`) to the same bidirectional-GRU-with-attention-pooling architecture used in the GRU sweep. Model knobs are `cnn_channels`, `gru_hidden`, `num_layers`, `cnn_dropout`, and `head_dropout`.
+
+### Config A — Baseline
+```
+cnn_channels=64, gru_hidden=128, num_layers=1, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=4, lr=3e-4, weight_decay=5e-3, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** Matches GRU-A's recurrent settings with a modest CNN front-end, testing whether local convolutional feature extraction helps before the GRU sees the sequence.
+
+---
+
+### Config B — Wider CNN + Deeper GRU
+```
+cnn_channels=128, gru_hidden=128, num_layers=2, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=8, lr=2e-4, weight_decay=5e-3, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** Scales up both the CNN encoder and the GRU depth together, mirroring GRU-B's deeper-recurrence hypothesis while also giving the conv front-end more filters to extract richer local patterns.
+
+---
+
+### Config C — Narrow CNN + Wide GRU
+```
+cnn_channels=32, gru_hidden=256, num_layers=1, cnn_dropout=0.1, head_dropout=0.2
+epochs=300, batch_size=4, lr=3e-4, weight_decay=1e-2, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** Shifts capacity away from the CNN and into the GRU, testing whether the convolutional stage only needs to extract coarse local structure while the recurrent stage does the heavy lifting.
+
+---
+
+### Config D — OneCycleLR
+```
+cnn_channels=64, gru_hidden=128, num_layers=2, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=4, lr=5e-4, weight_decay=5e-3, lambda_eol=1.0
+loss=smooth_l1, scheduler=onecycle
+```
+**Why:** Same model as B but with OneCycleLR, isolating the scheduler's effect on a CNN+GRU stack the same way GRU-D isolates it for the plain GRU.
+
+---
+
+### Config E — L1 Loss + Small
+```
+cnn_channels=32, gru_hidden=64, num_layers=2, cnn_dropout=0.3, head_dropout=0.4
+epochs=300, batch_size=4, lr=1e-4, weight_decay=2e-2, lambda_eol=2.0
+loss=l1, scheduler=cosine
+```
+**Why:** A compact, heavily regularised CNN-GRU, testing whether a smaller conv+recurrent stack generalises better on the small dataset — the CNN-GRU counterpart to GRU-E.
+
+---
+
+## CNN-LSTM Configs (`run_cnn_lstm_config_sweep.py`)
+
+The CNN-LSTM is structurally identical to the CNN-GRU (same conv encoder) but replaces the GRU with a bidirectional LSTM. Configs mirror the CNN-GRU sweep exactly (`cnn_channels`, `lstm_hidden`, `num_layers`, `cnn_dropout`, `head_dropout`) to enable a direct CNN-GRU vs CNN-LSTM comparison.
+
+### Config A — Baseline
+```
+cnn_channels=64, lstm_hidden=128, num_layers=1, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=4, lr=3e-4, weight_decay=5e-3, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** Direct LSTM analogue of CNN-GRU-A; keeps the conv front-end and training hyperparameters identical so any difference in results is attributable to the GRU vs LSTM cell.
+
+---
+
+### Config B — Wider CNN + Deeper LSTM
+```
+cnn_channels=128, lstm_hidden=128, num_layers=2, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=8, lr=2e-4, weight_decay=5e-3, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** LSTM analogue of CNN-GRU-B, testing whether the extra cell-state gate helps a deeper recurrent stack make better use of the wider CNN features.
+
+---
+
+### Config C — Narrow CNN + Wide LSTM
+```
+cnn_channels=32, lstm_hidden=256, num_layers=1, cnn_dropout=0.1, head_dropout=0.2
+epochs=300, batch_size=4, lr=3e-4, weight_decay=1e-2, lambda_eol=1.5
+loss=smooth_l1, scheduler=cosine
+```
+**Why:** LSTM analogue of CNN-GRU-C. Since LSTM has more parameters per unit of `lstm_hidden` than GRU, this tests whether the wider recurrent stage overfits sooner than its GRU counterpart.
+
+---
+
+### Config D — OneCycleLR
+```
+cnn_channels=64, lstm_hidden=128, num_layers=2, cnn_dropout=0.2, head_dropout=0.3
+epochs=300, batch_size=4, lr=5e-4, weight_decay=5e-3, lambda_eol=1.0
+loss=smooth_l1, scheduler=onecycle
+```
+**Why:** Same model as B but with OneCycleLR, isolating the scheduler's effect the same way CNN-GRU-D and LSTM-D do for their respective architectures.
+
+---
+
+### Config E — L1 Loss + Small
+```
+cnn_channels=32, lstm_hidden=64, num_layers=2, cnn_dropout=0.3, head_dropout=0.4
+epochs=300, batch_size=4, lr=1e-4, weight_decay=2e-2, lambda_eol=2.0
+loss=l1, scheduler=cosine
+```
+**Why:** Compact, heavily regularised CNN-LSTM — the smallest model in the CNN-augmented sweeps, useful for finding the minimum viable capacity when a conv front-end is present.
+
+---
+
 ## Cross-Model Design Philosophy
 
 The configs were designed with three goals in mind:
@@ -187,4 +295,4 @@ The configs were designed with three goals in mind:
 
 2. **Cover the regularisation axis.** Configs C and E represent two different regularisation strategies (wider+mild vs small+aggressive). On a ~100-cell dataset, overfitting is the dominant failure mode, so understanding where the regularisation sweet spot lies is critical.
 
-3. **Enable direct architecture comparison.** Transformer, GRU, and LSTM use identical training hyperparameters in configs A–E, identical cycle windows, and identical seeds. This means the sweep results can be directly compared across architectures without controlling for training differences.
+3. **Enable direct architecture comparison.** Transformer, GRU, LSTM, CNN-GRU, and CNN-LSTM use identical training hyperparameters in configs A–E, identical cycle windows, and identical seeds. This means the sweep results can be directly compared across architectures without controlling for training differences. CNN-GRU and CNN-LSTM additionally share identical CNN encoder settings, isolating the GRU-vs-LSTM comparison from the conv front-end.

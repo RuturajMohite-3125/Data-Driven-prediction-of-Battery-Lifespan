@@ -1116,7 +1116,7 @@ class HUSTDataProcessor:
 
 
 if __name__ == "__main__":
-    pkl_path = "/Users/ruturaj/Master-Thesis/Dataset/MIT"
+    pkl_path = "/Users/ruturaj/Master-Thesis/Dataset/HUST"
     cache_path = r"processed_hust_MIT_cache.pkl"
     processor = HUSTDataProcessor(pkl_path)
     cells_cache = processor.process_and_extract(cache_path=cache_path)

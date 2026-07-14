@@ -20,6 +20,7 @@ A Master's thesis project that predicts the **End-of-Life (EOL)** cycle count of
   - [Step 1 — Preprocess the Dataset](#step-1--preprocess-the-dataset)
   - [Step 2 — Train a Model](#step-2--train-a-model)
   - [Step 3 — Run a Config Sweep](#step-3--run-a-config-sweep)
+  - [Step 4 — Re-evaluate a Saved Checkpoint](#step-4--re-evaluate-a-saved-checkpoint)
 - [Environment Variables](#environment-variables)
 - [Saved Artifacts](#saved-artifacts)
 - [License](#license)
@@ -59,33 +60,54 @@ The project uses the **MIT/Stanford/Toyota LFP battery dataset** (Severson et al
 ```
 .
 ├── featureExtrcation/
-│   └── processDatasets.py          # Raw pkl → per-cycle feature cache
+│   ├── __init__.py
+│   └── processDatasets.py                # Raw pkl → per-cycle feature cache (HUSTDataProcessor)
 │
 ├── Models/
-│   ├── MIT_transformer_EOL.py            # Transformer
-│   ├── GRU_seq2seq.py                    # GRU 
-│   ├── LSTM_seq2seq.py                   # LSTM
-│   ├── CNN_GRU_EOL.py                    # CNN feature extractor + GRU
-│   ├── CNN_LSTM_EOL.py                   # CNN feature extractor + LSTM
+│   ├── MIT_transformer_EOL.py            # Transformer — train + evaluate
+│   ├── GRU_seq2seq.py                    # GRU — train + evaluate
+│   ├── LSTM_seq2seq.py                   # LSTM — train + evaluate
+│   ├── CNN_GRU_EOL.py                    # CNN feature extractor + GRU — train + evaluate
+│   ├── CNN_LSTM_EOL.py                   # CNN feature extractor + LSTM — train + 
+│   │
 │   ├── run_transformer_config_sweep.py   # Sweep runner — Transformer
 │   ├── run_gru_config_sweep.py           # Sweep runner — GRU
 │   ├── run_lstm_config_sweep.py          # Sweep runner — LSTM
 │   ├── run_cnn_gru_config_sweep.py       # Sweep runner — CNN-GRU
 │   ├── run_cnn_lstm_config_sweep.py      # Sweep runner — CNN-LSTM
+│   ├── run_cnn_gru_sweep.sh              # SLURM batch wrapper for the CNN-GRU sweep
+│   │
 │   ├── cell_split.json                   # Fixed train/val/test cell assignments
-│   ├── processed_hust_MIT_cache.pkl      # Cached feature extraction output
-│   └── SWEEP_CONFIGS.md            # Full sweep configuration documentation
+│   ├── processed_hust_MIT_cache.pkl      # Cached feature extraction output (loaded by every model script)
+│   ├── SWEEP_CONFIGS.md                  # Full sweep configuration documentation
+│   │
+│   └── aging_classifier_*.json           # Stage-1 XGBoost classifiers, one per architecture
+│       ├── aging_classifier_50_xgb.json          # Transformer pipeline
+│       ├── aging_classifier_gru_50_xgb.json       # GRU pipeline
+│       ├── aging_classifier_lstm_50_xgb.json      # LSTM pipeline
+│       ├── aging_classifier_cnn_gru_50_xgb.json   # CNN-GRU pipeline
+│       └── aging_classifier_cnn_lstm_50_xgb.json  # CNN-LSTM pipeline
 │
 ├── Results/
-│   ├── global_sweep_report.md      # Full cross-model sweep results table
+│   ├── global_sweep_report.md      # Full cross-model sweep results table (all 5 architectures)
 │   ├── gru_sweep_report.md         # GRU-specific sweep results
 │   ├── lstm_sweep_report.md        # LSTM-specific sweep results
 │   ├── transformer_sweep_report.md # Transformer-specific sweep results
-│   └── cnn_gru_sweep_results.json  # Raw CNN-GRU sweep output --> to be rerun
+│   ├── cnn_gru_sweep_report.md     # CNN-GRU-specific sweep results
+│   ├── cnn_lstm_sweep_report.md    # CNN-LSTM-specific sweep results
+│   └── *_sweep_results.json        # Raw per-seed sweep output backing each *_report.md above
+│
+├── best_eol_transformer_50_cycle_window.pt   # Best Transformer checkpoint (repo root)
+├── best_eol_gru_50_cycle_window.pt           # Best GRU checkpoint
+├── best_eol_lstm_50_cycle_window.pt          # Best LSTM checkpoint
+├── best_eol_cnn_gru_50_cycle_window.pt       # Best CNN-GRU checkpoint
+├── best_eol_cnn_lstm_50_cycle_window.pt      # Best CNN-LSTM checkpoint
 │
 ├── requirements.txt
 └── LICENSE
 ```
+
+> Checkpoints (`*.pt`) are git-ignored — they're regenerated locally whenever a model script is run with `EOL_SAVE_ARTIFACTS=1` (the default). Only `best_eol_transformer_50_cycle_window.pt` and `Models/aging_classifier_50_xgb.json` are committed as reference artifacts; the rest are working-tree outputs.
 
 ---
 
@@ -193,25 +215,40 @@ Same as CNN-GRU but with LSTM cells replacing the GRU.
 
 ## Results
 
-Best results from the cross-model sweep (mean ± std over 10 random seeds). **Accuracy** = fraction of test cells with predicted EOL within ±10% of true EOL.
+Best results from the cross-model sweep (mean ± std over 10 random seeds). **Accuracy** = fraction of test cells with predicted EOL within ±10% of true EOL. Sweep now covers five architectures — Transformer, GRU, LSTM, CNN-GRU, and CNN-LSTM — across all 6 cycle windows and 5 configs (150 model × window × config combinations total).
 
 | Rank | Model | Window | Config | Accuracy (%) | MAE (cycles) | RMSE (cycles) | R² |
 |------|-------|--------|--------|-------------|--------------|--------------|-----|
-| 1 | **GRU** | W2: stride-10, 1–250 | A — Baseline (hidden=128, layers=1) | **85.0 ± 3.6** | **34.3 ± 3.1** | 44.4 ± 4.4 | 0.956 ± 0.008 |
-| 2 | GRU | W5: 7 landmarks | E — L1 + Small (hidden=64, layers=2) | 83.9 ± 7.2 | 35.0 ± 2.0 | 51.7 ± 3.6 | 0.941 ± 0.008 |
-| 3 | LSTM | W5: 7 landmarks | E — L1 + Small (hidden=64, layers=2) | 83.9 ± 6.8 | 36.0 ± 2.8 | 48.1 ± 4.2 | 0.949 ± 0.009 |
-| 4 | GRU | W2: stride-10, 1–250 | C — Wider (hidden=256, layers=1) | 82.2 ± 6.0 | **32.5 ± 3.4** | 44.7 ± 3.9 | 0.956 ± 0.008 |
-| 5 | LSTM | W2: stride-10, 1–250 | E — L1 + Small (hidden=64, layers=2) | 82.2 ± 5.4 | 35.4 ± 2.9 | 46.0 ± 3.6 | 0.953 ± 0.008 |
-| 6 | Transformer | W5: 7 landmarks | A — Baseline | 81.7 ± 7.5 | 35.0 ± 5.8 | 45.3 ± 8.2 | 0.954 ± 0.016 |
+| 1 | **GRU** | W5: 7 landmarks | E — L1 + Small (hidden=64, layers=2) | **100.0 ± 0.0** | 32.2 ± 2.4 | 41.9 ± 3.1 | 0.961 ± 0.006 |
+| 2 | LSTM | W5: 7 landmarks | B — Deeper (hidden=128, layers=2) | 99.4 ± 1.8 | **28.5 ± 2.3** | 37.9 ± 3.0 | 0.968 ± 0.005 |
+| 3 | GRU | W5: 7 landmarks | A — Baseline (hidden=128, layers=1) | 98.9 ± 2.3 | 28.9 ± 3.0 | 40.2 ± 5.2 | 0.964 ± 0.009 |
+| 4 | LSTM | W5: 7 landmarks | A — Baseline (hidden=128, layers=1) | 98.9 ± 2.3 | 27.7 ± 2.4 | 38.9 ± 3.8 | 0.967 ± 0.006 |
+| 5 | GRU | W5: 7 landmarks | B — Deeper (hidden=128, layers=2) | 98.3 ± 2.7 | 29.1 ± 3.0 | 40.6 ± 4.4 | 0.964 ± 0.008 |
+| 6 | LSTM | W5: 7 landmarks | C — Wider (hidden=256, layers=1) | 97.2 ± 3.9 | 30.6 ± 3.5 | 43.3 ± 4.5 | 0.958 ± 0.009 |
 
-Full results for all 97 model × window × config combinations are in [Results/global_sweep_report.md](Results/global_sweep_report.md).
+Full results for all 150 model × window × config combinations are in [Results/global_sweep_report.md](Results/global_sweep_report.md), with per-architecture breakdowns in [Results/gru_sweep_report.md](Results/gru_sweep_report.md), [Results/lstm_sweep_report.md](Results/lstm_sweep_report.md), [Results/transformer_sweep_report.md](Results/transformer_sweep_report.md), [Results/cnn_gru_sweep_report.md](Results/cnn_gru_sweep_report.md), and [Results/cnn_lstm_sweep_report.md](Results/cnn_lstm_sweep_report.md).
+
+### Best Config per Model Class
+
+Top-performing window/config combination for each of the five architectures (mean ± std over 10 seeds):
+
+| Model | Window | Config | Accuracy (%) | MAE (cycles) | RMSE (cycles) | R² |
+|-------|--------|--------|-------------|--------------|--------------|-----|
+| **GRU** | W5: 7 landmarks | E — L1 + Small (hidden=64, layers=2) | **100.0 ± 0.0** | 32.2 ± 2.4 | 41.9 ± 3.1 | 0.961 ± 0.006 |
+| **LSTM** | W5: 7 landmarks | B — Deeper (hidden=128, layers=2) | 99.4 ± 1.8 | **28.5 ± 2.3** | **37.9 ± 3.0** | **0.968 ± 0.005** |
+| **Transformer** | W4: three bands | A — Baseline (d_model=64, nhead=4, layers=2) | 92.2 ± 3.9 | 34.4 ± 4.8 | 46.1 ± 7.9 | 0.952 ± 0.017 |
+| **CNN-LSTM** | W3: early+late | A — Baseline (cnn=64, lstm=128, layers=1) | 88.9 ± 8.3 | 38.9 ± 10.2 | 56.7 ± 17.2 | 0.924 ± 0.049 |
+| **CNN-GRU** | W5: 7 landmarks | E — L1 + Small (cnn=32, gru=64, layers=2) | 86.7 ± 6.5 | 46.7 ± 6.5 | 63.3 ± 10.5 | 0.910 ± 0.029 |
+
+Recurrent models without CNN front-ends (GRU, LSTM) dominate; adding a CNN feature extractor (CNN-GRU, CNN-LSTM) hurts accuracy on this dataset rather than helping it.
 
 **Key findings:**
 
-- The **GRU with sparse uniform sampling (W2, stride-10)** is the top performer, reaching 85% accuracy within ±10% EOL, with MAE of ~34 cycles and R² ≈ 0.956.
-- **Window W2 and W5 consistently outperform W0 and W1**, demonstrating that even sparse observations beyond cycle 100 significantly improve prediction over early-life-only windows.
-- All three architectures (GRU, LSTM, Transformer) converge to similar accuracy on the best windows, with GRU having a slight edge in stability (lower std across seeds).
-- Early-life-only windows (W0: first 50 cycles) achieve ~62–65% accuracy, confirming that mid-life measurements carry substantial degradation information.
+- The **GRU and LSTM on the sparse landmark window (W5: cycles 1, 10, 50, 100, 150, 200, 250)** are now the top performers, both reaching ≥98% accuracy within ±10% EOL with R² ≈ 0.96–0.97 — GRU/LSTM overtook the previously-best W2 (stride-10) window after the latest config retune.
+- Recurrent models (GRU, LSTM) clearly outperform their CNN-augmented counterparts: best CNN-GRU tops out at 86.7% (W5) and best CNN-LSTM at 88.9% (W3), both well behind plain GRU/LSTM.
+- **W5 and W4 consistently outperform W0 and W1** for every architecture, confirming that even a handful of well-chosen cycles beyond cycle 100 carry more degradation signal than a dense early-life-only window.
+- Early-life-only windows (W0: first 50 cycles) top out around 73–81% accuracy across architectures — usable, but well short of what late-cycle landmarks provide.
+- The near-perfect W5 accuracy (100.0 ± 0.0 for GRU) is on a held-out test set of only 18 cells; treat it as an upper bound rather than a generalization guarantee, and see it as a candidate for a leakage/overfitting sanity check before quoting it as a final result.
 
 ---
 
@@ -250,7 +287,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-All scripts are run from the **repository root** so that the `featureExtrcation` package is importable.
+All commands below are run from the **repository root** (with the virtualenv activated) so that the `featureExtrcation` package is importable and the relative artifact paths resolve correctly.
 
 ### Step 1 — Preprocess the Dataset
 
@@ -258,7 +295,15 @@ All scripts are run from the **repository root** so that the `featureExtrcation`
 python featureExtrcation/processDatasets.py
 ```
 
-This reads raw `.pkl` files from `RAW_PKL_PATH` (edit the path at the bottom of the script), extracts 18 per-cycle features for every cell, and writes the result to `Models/processed_hust_MIT_cache.pkl`. Subsequent runs load from cache and skip reprocessing.
+This reads raw per-cell `.pkl` files from `RAW_PKL_PATH` (hard-coded at the bottom of the script — edit it to point at your local dataset copy), extracts 18 per-cycle features for every cell, and writes the cache to `processed_hust_MIT_cache.pkl` **in the current working directory** (the repo root, if run as above). Subsequent runs of this script load from that cache and skip reprocessing.
+
+Every model script (`Models/*.py`) instead expects the cache at `Models/processed_hust_MIT_cache.pkl`. Move or copy it there once after generating it:
+
+```bash
+mv processed_hust_MIT_cache.pkl Models/
+```
+
+A pre-generated cache is already committed at [Models/processed_hust_MIT_cache.pkl](Models/processed_hust_MIT_cache.pkl), so this step can be skipped entirely if you just want to train/evaluate models against the existing feature set.
 
 ### Step 2 — Train a Model
 
@@ -309,6 +354,12 @@ python Models/run_cnn_lstm_config_sweep.py
 
 The active cycle window is controlled by the `EOL_CYCLES_TO_USE` environment variable (see below).
 
+To run the CNN-GRU sweep on a SLURM cluster instead of locally, use the batch wrapper (edit `#SBATCH --partition` first):
+
+```bash
+sbatch Models/run_cnn_gru_sweep.sh
+```
+
 ---
 
 ## Environment Variables
@@ -338,11 +389,13 @@ All model scripts and sweep runners are fully configurable via environment varia
 EOL_CYCLES_TO_USE=1,10,50,100,150,200,250 EOL_SHOW_PLOTS=0 python Models/GRU_seq2seq.py
 ```
 
-**Example — reproduce the best GRU result (W2, stride-10):**
+**Example — reproduce the best GRU result (W5 landmarks, Config E):**
 
 ```bash
-EOL_CYCLES_TO_USE=$(python -c "print(','.join(str(i) for i in range(1,251,10)))") \
-  EOL_HIDDEN_SIZE=128 EOL_NUM_LAYERS=1 EOL_LOSS=smooth_l1 EOL_SCHEDULER=cosine \
+EOL_CYCLES_TO_USE=1,10,50,100,150,200,250 \
+  EOL_HIDDEN_SIZE=64 EOL_NUM_LAYERS=2 EOL_HEAD_DROPOUT=0.4 \
+  EOL_LR=1e-4 EOL_WEIGHT_DECAY=0.02 EOL_LAMBDA_EOL=2.0 \
+  EOL_LOSS=l1 EOL_SCHEDULER=cosine \
   python Models/GRU_seq2seq.py
 ```
 
@@ -350,18 +403,17 @@ EOL_CYCLES_TO_USE=$(python -c "print(','.join(str(i) for i in range(1,251,10)))"
 
 ## Saved Artifacts
 
-Pre-trained checkpoints for the best single-seed runs are included in the repository root:
+Pre-trained checkpoints for the best single-seed runs are included in the repository root, each paired with a Stage-1 XGBoost classifier under `Models/`:
 
-| File | Description |
-|---|---|
-| `best_eol_gru_50_cycle_window.pt` | Best GRU model (W5 window, Config A) |
-| `best_eol_lstm_50_cycle_window.pt` | Best LSTM model (W5 window) |
-| `best_eol_transformer_50_cycle_window.pt` | Best Transformer model (W5 window) |
-| `Models/aging_classifier_gru_50_xgb.json` | XGBoost Stage-1 classifier for GRU pipeline |
-| `Models/aging_classifier_lstm_50_xgb.json` | XGBoost Stage-1 classifier for LSTM pipeline |
-| `Models/aging_classifier_50_xgb.json` | XGBoost Stage-1 classifier for Transformer pipeline |
+| Model | Checkpoint (repo root) | Stage-1 classifier (`Models/`) |
+|---|---|---|
+| Transformer | `best_eol_transformer_50_cycle_window.pt` | `aging_classifier_50_xgb.json` |
+| GRU | `best_eol_gru_50_cycle_window.pt` | `aging_classifier_gru_50_xgb.json` |
+| LSTM | `best_eol_lstm_50_cycle_window.pt` | `aging_classifier_lstm_50_xgb.json` |
+| CNN-GRU | `best_eol_cnn_gru_50_cycle_window.pt` | `aging_classifier_cnn_gru_50_xgb.json` |
+| CNN-LSTM | `best_eol_cnn_lstm_50_cycle_window.pt` | `aging_classifier_cnn_lstm_50_xgb.json` |
 
-Each `.pt` checkpoint contains the full model state dict, feature normalisation statistics, target normalisation statistics, tertile thresholds, class-mean EOL priors, and the calibration blend coefficient α.
+Each `.pt` checkpoint contains the full model state dict, feature normalisation statistics, target normalisation statistics, tertile thresholds, class-mean EOL priors, and the calibration blend coefficient α. Checkpoints are regenerated automatically by the corresponding model script in [Step 2](#step-2--train-a-model) whenever `EOL_SAVE_ARTIFACTS=1` (the default); only `best_eol_transformer_50_cycle_window.pt` is committed to the repo as a reference artifact.
 
 ---
 
