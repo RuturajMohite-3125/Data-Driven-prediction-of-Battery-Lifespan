@@ -22,10 +22,12 @@ MIN_CUR = 1e-1
 
 DQDV_BINS = 1000
 
+V_WINDOW_MIN = 2.4
+V_WINDOW_MAX = 3.6
+
 
 def _interp_nan(arr):
-    """Fill non-finite entries via linear interpolation over their index.
-    Ported from gen_bml_features.py's _interp_nan."""
+   
     arr = np.asarray(arr, dtype=np.float32).reshape(-1).copy()
     if arr.size == 0:
         return arr
@@ -42,8 +44,7 @@ def _interp_nan(arr):
 
 
 def _dedupe_interp(x, y, grid):
-    """Sort by x, average y for duplicate x, then linearly interpolate onto
-    grid. Ported from gen_bml_features.py's _dedupe_interp."""
+   
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     valid = np.isfinite(x) & np.isfinite(y)
@@ -91,24 +92,16 @@ class HUSTDataProcessor:
     def _collect_dqdv_grids(self, cell, cycles_data, n_bins=DQDV_BINS):
         """
         Fixed voltage/capacity grid for this cell's dQ/dV and dV/dQ, shared
-        across all of its cycles — same method as gen_bml_features.py's
-        _collect_voltage_limits: prefer the cell's declared voltage limits,
-        else fall back to the 1st/99th percentile of filtered discharge
-        voltage over its first 50 cycles. The capacity grid mirrors the same
-        approach (no equivalent in gen_bml_features.py, which doesn't
-        compute dV/dQ).
+        across all of its cycles. Voltage is pinned to
+        [V_WINDOW_MIN, V_WINDOW_MAX] (rather than the cell's declared
+        limits or a percentile estimate) so every cell uses the same
+        window. The capacity grid is the 1st/99th percentile of discharge
+        capacity within that voltage window, over the cell's first 50
+        cycles.
         """
-        vmin = cell.get("min_voltage_limit_in_V") if isinstance(cell, dict) else None
-        vmax = cell.get("max_voltage_limit_in_V") if isinstance(cell, dict) else None
-        try:
-            have_v_limits = (
-                vmin is not None and vmax is not None
-                and np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin
-            )
-        except TypeError:
-            have_v_limits = False
+        vmin, vmax = V_WINDOW_MIN, V_WINDOW_MAX
 
-        v_samples, q_samples = [], []
+        q_samples = []
         for item in cycles_data[:min(len(cycles_data), 50)]:
             if not isinstance(item, dict):
                 continue
@@ -118,20 +111,11 @@ class HUSTDataProcessor:
             n = min(voltage.size, current.size, capacity.size)
             if n < 2:
                 continue
-            discharge = np.isfinite(voltage[:n]) & np.isfinite(current[:n]) & (current[:n] < -MIN_CUR)
+            discharge = (np.isfinite(voltage[:n]) & np.isfinite(current[:n])
+                         & (current[:n] < -MIN_CUR)
+                         & (voltage[:n] >= vmin) & (voltage[:n] <= vmax))
             if discharge.sum() >= 2:
-                v_samples.append(voltage[:n][discharge])
                 q_samples.append(capacity[:n][discharge])
-
-        if not have_v_limits:
-            if v_samples:
-                all_v = np.concatenate(v_samples)
-                vmin = float(np.nanpercentile(all_v, 1))
-                vmax = float(np.nanpercentile(all_v, 99))
-            else:
-                vmin, vmax = 0.0, 1.0
-            if not (np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin):
-                vmin, vmax = 0.0, 1.0
 
         if q_samples:
             all_q = np.concatenate(q_samples)
@@ -152,8 +136,9 @@ class HUSTDataProcessor:
         discharge_capacity = np.asarray(item['discharge_capacity_in_Ah'])
         current = np.asarray(item['current_in_A'])
 
-        charge_mask = current > MIN_CUR
-        discharge_mask = current < -MIN_CUR
+        v_window = (voltage >= V_WINDOW_MIN) & (voltage <= V_WINDOW_MAX)
+        charge_mask = (current > MIN_CUR) & v_window
+        discharge_mask = (current < -MIN_CUR) & v_window
 
         V_c = voltage[charge_mask]
         Q_c = charge_capacity[charge_mask]
@@ -163,7 +148,11 @@ class HUSTDataProcessor:
         I_d = current[discharge_mask]
 
         discharge_deriv = self.calculate_dQdV(V_d, Q_d, v_grid=v_grid, q_grid=q_grid)
-        soh_val = float(np.max(Q_d)) if len(Q_d) > 0 else 0.0
+
+       
+        full_discharge_mask = current < -MIN_CUR
+        Q_d_full = discharge_capacity[full_discharge_mask]
+        soh_val = float(np.max(Q_d_full)) if len(Q_d_full) > 0 else 0.0
 
         return {
             'voltage_charge': V_c, 'capacity_charge': Q_c, 'current_charge': I_c,
@@ -1414,6 +1403,6 @@ if __name__ == "__main__":
     #processor.plot_discharge_capacity_vs_voltage(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
     #processor.plot_voltage_kurtosis(cells_cache=cells_cache, cell_ids=CELL_IDS)
     #processor.plot_dqdv_diff(cell_ids=["b2c34"], ref_cycle=10, cycle_step=50)
-    #processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
+    processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
