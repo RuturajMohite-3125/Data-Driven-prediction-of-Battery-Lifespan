@@ -208,8 +208,8 @@ class HUSTDataProcessor:
             print(f"Loading cached data from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
-            if cache and ('soh_traj' not in cache[0] or 'dqdv_curves' not in cache[0]):
-                print("Cache missing 'soh_traj'/'dqdv_curves' field — regenerating cache...")
+            if cache and 'soh_traj' not in cache[0]:
+                print("Cache missing 'soh_traj' field — regenerating cache...")
             else:
                 print(f"Loaded {len(cache)} cells from cache.")
                 return cache
@@ -276,10 +276,6 @@ class HUSTDataProcessor:
                 'soh_traj': soh_traj,  
                 'eol': eol_cycle,
                 'num_cycles': n_cycles,
-                'v_grid': v_grid,               
-                'q_grid': q_grid,               
-                'dqdv_curves': dqdv_curves,      
-                'dvdq_curves': dvdq_curves,      
             })
 
             del soh_list, soh_array, cell_features, dqdv_curves, dvdq_curves
