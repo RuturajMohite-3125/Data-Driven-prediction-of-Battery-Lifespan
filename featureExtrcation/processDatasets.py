@@ -22,8 +22,9 @@ MIN_CUR = 1e-1
 
 DQDV_BINS = 1000
 
-V_WINDOW_MIN = 2.4
-V_WINDOW_MAX = 3.6
+
+DQDV_WINDOW = (100, 900)
+DQDV_SMOOTH_KERNEL = 10
 
 
 def _interp_nan(arr):
@@ -44,7 +45,7 @@ def _interp_nan(arr):
 
 
 def _dedupe_interp(x, y, grid):
-   
+    
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     valid = np.isfinite(x) & np.isfinite(y)
@@ -70,6 +71,15 @@ def _dedupe_interp(x, y, grid):
     return np.interp(grid, unique_x, unique_y).astype(np.float32)
 
 
+def _smooth_dqdv_window(dqdv, window=DQDV_WINDOW, kernel=DQDV_SMOOTH_KERNEL):
+    dqdv = np.asarray(dqdv, dtype=np.float32).reshape(-1)
+    lo, hi = window
+    windowed = dqdv[lo:hi]
+    if windowed.size < kernel:
+        return windowed
+    return np.convolve(windowed, np.ones(kernel) / kernel, mode='valid')
+
+
 class HUSTDataProcessor:
     def __init__(self, pkl_path, min_cycles=0):
         self.pkl_path = pkl_path
@@ -90,18 +100,18 @@ class HUSTDataProcessor:
             gc.collect()
 
     def _collect_dqdv_grids(self, cell, cycles_data, n_bins=DQDV_BINS):
-        """
-        Fixed voltage/capacity grid for this cell's dQ/dV and dV/dQ, shared
-        across all of its cycles. Voltage is pinned to
-        [V_WINDOW_MIN, V_WINDOW_MAX] (rather than the cell's declared
-        limits or a percentile estimate) so every cell uses the same
-        window. The capacity grid is the 1st/99th percentile of discharge
-        capacity within that voltage window, over the cell's first 50
-        cycles.
-        """
-        vmin, vmax = V_WINDOW_MIN, V_WINDOW_MAX
+        
+        vmin = cell.get("min_voltage_limit_in_V") if isinstance(cell, dict) else None
+        vmax = cell.get("max_voltage_limit_in_V") if isinstance(cell, dict) else None
+        try:
+            have_v_limits = (
+                vmin is not None and vmax is not None
+                and np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin
+            )
+        except TypeError:
+            have_v_limits = False
 
-        q_samples = []
+        v_samples, q_samples = [], []
         for item in cycles_data[:min(len(cycles_data), 50)]:
             if not isinstance(item, dict):
                 continue
@@ -111,11 +121,20 @@ class HUSTDataProcessor:
             n = min(voltage.size, current.size, capacity.size)
             if n < 2:
                 continue
-            discharge = (np.isfinite(voltage[:n]) & np.isfinite(current[:n])
-                         & (current[:n] < -MIN_CUR)
-                         & (voltage[:n] >= vmin) & (voltage[:n] <= vmax))
+            discharge = np.isfinite(voltage[:n]) & np.isfinite(current[:n]) & (current[:n] < -MIN_CUR)
             if discharge.sum() >= 2:
+                v_samples.append(voltage[:n][discharge])
                 q_samples.append(capacity[:n][discharge])
+
+        if not have_v_limits:
+            if v_samples:
+                all_v = np.concatenate(v_samples)
+                vmin = float(np.nanpercentile(all_v, 1))
+                vmax = float(np.nanpercentile(all_v, 99))
+            else:
+                vmin, vmax = 0.0, 1.0
+            if not (np.isfinite(vmin) and np.isfinite(vmax) and vmax > vmin):
+                vmin, vmax = 0.0, 1.0
 
         if q_samples:
             all_q = np.concatenate(q_samples)
@@ -136,33 +155,39 @@ class HUSTDataProcessor:
         discharge_capacity = np.asarray(item['discharge_capacity_in_Ah'])
         current = np.asarray(item['current_in_A'])
 
-        v_window = (voltage >= V_WINDOW_MIN) & (voltage <= V_WINDOW_MAX)
-        charge_mask = (current > MIN_CUR) & v_window
-        discharge_mask = (current < -MIN_CUR) & v_window
+        time_s = np.asarray(item['time_in_s']) * 60.0
+        n = min(voltage.size, current.size, charge_capacity.size, discharge_capacity.size, time_s.size)
+        voltage, current = voltage[:n], current[:n]
+        charge_capacity, discharge_capacity = charge_capacity[:n], discharge_capacity[:n]
+        time_s = time_s[:n]
+
+        charge_mask = current > MIN_CUR
+        discharge_mask = current < -MIN_CUR
 
         V_c = voltage[charge_mask]
         Q_c = charge_capacity[charge_mask]
         I_c = current[charge_mask]
+        T_c = time_s[charge_mask]
         V_d = voltage[discharge_mask]
         Q_d = discharge_capacity[discharge_mask]
         I_d = current[discharge_mask]
+        T_d = time_s[discharge_mask]
 
         discharge_deriv = self.calculate_dQdV(V_d, Q_d, v_grid=v_grid, q_grid=q_grid)
-
-       
-        full_discharge_mask = current < -MIN_CUR
-        Q_d_full = discharge_capacity[full_discharge_mask]
-        soh_val = float(np.max(Q_d_full)) if len(Q_d_full) > 0 else 0.0
+        soh_val = float(np.max(Q_d)) if len(Q_d) > 0 else 0.0
+        charge_time = float(T_c[-1] - T_c[0]) if len(T_c) > 1 else 0.0
+        discharge_time = float(T_d[-1] - T_d[0]) if len(T_d) > 1 else 0.0
 
         return {
             'voltage_charge': V_c, 'capacity_charge': Q_c, 'current_charge': I_c,
             'voltage_discharge': V_d, 'capacity_discharge': Q_d, 'current_discharge': I_d,
+            'charge_time': charge_time, 'discharge_time': discharge_time,
         }, discharge_deriv, soh_val
 
     def _extract_cycle_features(self, cycle_data, deriv, deriv_10):
         if deriv is not None:
-            dQdV = deriv["dQdV"]
-            dQdV_10 = deriv_10["dQdV"] if deriv_10 is not None else np.array([])
+            dQdV = _smooth_dqdv_window(deriv["dQdV"])
+            dQdV_10 = _smooth_dqdv_window(deriv_10["dQdV"]) if deriv_10 is not None else np.array([])
             ref_max = float(np.max(dQdV_10)) if len(dQdV_10) > 0 else 0.0
             ref_min = float(np.min(dQdV_10)) if len(dQdV_10) > 0 else 0.0
             ref_var = float(np.var(dQdV_10)) if len(dQdV_10) > 0 else 0.0
@@ -200,16 +225,17 @@ class HUSTDataProcessor:
                 float(np.min(V_d)), float(np.max(V_d)),
                 max_Q_d, float(kurtosis(V_d)),
                 coulombic_eff, v_drop_start,
+                cycle_data['charge_time'], cycle_data['discharge_time'],
             ]
-        return [0] * 21
+        return [0] * 23
 
     def process_and_extract(self, cache_path=None):
         if cache_path and os.path.exists(cache_path):
             print(f"Loading cached data from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache = pickle.load(f)
-            if cache and 'soh_traj' not in cache[0]:
-                print("Cache missing 'soh_traj' field — regenerating cache...")
+            if cache and ('soh_traj' not in cache[0] or 'dqdv_curves' not in cache[0]):
+                print("Cache missing 'soh_traj'/'dqdv_curves' field — regenerating cache...")
             else:
                 print(f"Loaded {len(cache)} cells from cache.")
                 return cache
@@ -238,7 +264,7 @@ class HUSTDataProcessor:
             for idx, item in enumerate(cycles_data):
                 if not isinstance(item, dict):
                     soh_list.append(0.0)
-                    cell_features.append([0.0] * 18)
+                    cell_features.append([0.0] * 24)
                     continue
 
                 processed, deriv, soh_val = self._process_single_cycle(item, v_grid=v_grid, q_grid=q_grid)
@@ -276,6 +302,10 @@ class HUSTDataProcessor:
                 'soh_traj': soh_traj,  
                 'eol': eol_cycle,
                 'num_cycles': n_cycles,
+                'v_grid': v_grid,               
+                'q_grid': q_grid,               
+                'dqdv_curves': dqdv_curves,      
+                'dvdq_curves': dvdq_curves,      
             })
 
             del soh_list, soh_array, cell_features, dqdv_curves, dvdq_curves
@@ -290,16 +320,7 @@ class HUSTDataProcessor:
         return cells_cache
 
     def plot_discharge_capacity_vs_voltage(self, cell_ids, cycle_ids, max_pts=500):
-        """
-        Plot discharge capacity vs voltage for selected cells and cycles.
-
-        cell_ids  : list of cell names (str) or 0-based indices (int) relative to
-                    the sorted list of pkl files in self.pkl_path.
-        cycle_ids : list of 0-based cycle indices to plot for every selected cell.
-        max_pts   : max points per cycle before downsampling (default 500).
-
-        Each cell gets one subplot; cycles are coloured by index (plasma colormap).
-        """
+        
         pkl_files = glob.glob(os.path.join(self.pkl_path, "*.pkl"))
         file_map = {}
         for f in sorted(pkl_files):
@@ -387,18 +408,7 @@ class HUSTDataProcessor:
         plt.show()
 
     def plot_voltage_kurtosis(self, cells_cache, cell_ids):
-        """
-        Plot discharge-voltage kurtosis vs cycle index in a grid, one subplot
-        per selected cell, across all of each cell's cycles.
-
-        cells_cache : list of cell dicts as returned by process_and_extract().
-        cell_ids    : list of cell names (str) or 0-based indices (int) into
-                      cells_cache.
-
-        Points are coloured by cycle index; a single colorbar (scaled
-        0..max EOL among the selected cells) is placed outside the grid on
-        the right. Grid has a fixed 4 columns.
-        """
+        
         resolved = []
         for cid in cell_ids:
             if isinstance(cid, int):
@@ -465,16 +475,7 @@ class HUSTDataProcessor:
 
     def calculate_dQdV(self, voltage, capacity, v_min=None, v_max=None, n_bins=DQDV_BINS,
                         v_grid=None, q_grid=None):
-        """
-        dQ/dV and dV/dQ via fixed-grid interpolation + np.gradient — same
-        method as gen_bml_features.py's _cycle_qdlin/_dedupe_interp +
-        np.gradient(qd_curve, voltage_grid), applied symmetrically for dV/dQ.
-
-        v_grid / q_grid : optional precomputed grids shared across a cell's
-        cycles (see _collect_dqdv_grids), matching gen_bml_features.py's
-        single-grid-per-cell approach. If omitted, falls back to a grid
-        built from this call's own voltage/capacity min/max (per-cycle grid).
-        """
+        
         voltage = np.asarray(voltage, dtype=np.float64)
         capacity = np.asarray(capacity, dtype=np.float64)
 
@@ -592,11 +593,7 @@ class HUSTDataProcessor:
         plt.show()
 
     def plot_soh_all(self, cells_cache, normalize=True):
-        """
-        Plot SoH curves for all cells in cells_cache, coloured by EOL length.
-
-        normalize : divide each cell's capacity by its peak value.
-        """
+    
         if not cells_cache:
             print("No cells in cache.")
             return
@@ -726,6 +723,7 @@ class HUSTDataProcessor:
             'min_I_c', 'max_I_c', 'min_V_c', 'max_V_c',
             'min_I_d', 'max_I_d', 'min_V_d', 'max_V_d',
             'max_Q_d', 'kurtosis_Vd', 'coulombic_eff', 'v_drop_start',
+            'charge_time', 'discharge_time',
         ]
 
         rows = []
@@ -1399,6 +1397,6 @@ if __name__ == "__main__":
     #processor.plot_discharge_capacity_vs_voltage(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
     #processor.plot_voltage_kurtosis(cells_cache=cells_cache, cell_ids=CELL_IDS)
     #processor.plot_dqdv_diff(cell_ids=["b2c34"], ref_cycle=10, cycle_step=50)
-    processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
+    #processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
