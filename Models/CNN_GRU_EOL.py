@@ -1,6 +1,5 @@
 
 import json
-import math
 import os
 import pickle
 
@@ -13,7 +12,9 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
 
-from featureExtrcation.processDatasets import HUSTDataProcessor
+from featureExtrcation.processDatasets import (
+    HUSTDataProcessor, DQDV_V_WINDOWS, N_DQDV_FEATS,
+)
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +30,7 @@ CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
 
-SEED = int(os.environ.get("EOL_SEED", "42")) 
+SEED = int(os.environ.get("EOL_SEED", "42"))
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -43,11 +44,11 @@ SHOW_PLOTS = os.environ.get("EOL_SHOW_PLOTS", "1") == "1"
 SAVE_ARTIFACTS = os.environ.get("EOL_SAVE_ARTIFACTS", "1") == "1"
 
 MODEL_CFG = {
-    "cnn_channels": int(os.environ.get("EOL_CNN_CHANNELS", "64")),
+    "cnn_channels":  int(os.environ.get("EOL_CNN_CHANNELS",  "64")),
     "gru_hidden":   int(os.environ.get("EOL_GRU_HIDDEN",   "128")),
-    "num_layers":   int(os.environ.get("EOL_NUM_LAYERS",   "1")),
-    "cnn_dropout":  float(os.environ.get("EOL_CNN_DROPOUT",  "0.2")),
-    "head_dropout": float(os.environ.get("EOL_HEAD_DROPOUT", "0.3")),
+    "num_layers":    int(os.environ.get("EOL_NUM_LAYERS",    "1")),
+    "cnn_dropout":   float(os.environ.get("EOL_CNN_DROPOUT",   "0.2")),
+    "head_dropout":  float(os.environ.get("EOL_HEAD_DROPOUT",  "0.3")),
 }
 TRAIN_CFG = {
     "epochs":       int(os.environ.get("EOL_EPOCHS",       "300")),
@@ -60,40 +61,25 @@ LOSS_TYPE = os.environ.get("EOL_LOSS", "smooth_l1")
 SCHEDULER = os.environ.get("EOL_SCHEDULER", "cosine")
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 512):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
-
-
 class CNNGRUEOLPredictor(nn.Module):
-    """CNN encoder -> GRU sequence model for EOL prediction."""
+    """CNN encoder -> bidirectional GRU sequence model for EOL prediction."""
 
-    def __init__(self, input_size, cnn_channels=64, gru_hidden_size=128, num_layers=1,
-                 cnn_dropout=0.2, head_dropout=0.3):
+    def __init__(self, input_size, cnn_channels=64, gru_hidden_size=128, num_layers=1):
         super().__init__()
 
         self.cnn_encoder = nn.Sequential(
             nn.Conv1d(in_channels=input_size, out_channels=cnn_channels, kernel_size=3, padding=1, stride=1),
             nn.BatchNorm1d(cnn_channels),
             nn.ReLU(),
-            nn.Dropout(cnn_dropout),
+            nn.Dropout(0.2),
             nn.Conv1d(in_channels=cnn_channels, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
             nn.BatchNorm1d(cnn_channels * 2),
             nn.ReLU(),
-            nn.Dropout(cnn_dropout),
+            nn.Dropout(0.2),
             nn.Conv1d(in_channels=cnn_channels * 2, out_channels=cnn_channels * 2, kernel_size=3, padding=1, stride=1),
             nn.BatchNorm1d(cnn_channels * 2),
             nn.ReLU(),
-            nn.Dropout(cnn_dropout),
+            nn.Dropout(0.2),
         )
 
         self.gru = nn.GRU(
@@ -108,13 +94,13 @@ class CNNGRUEOLPredictor(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(gru_hidden_size * 2, 256),
             nn.ReLU(),
-            nn.Dropout(head_dropout),
+            nn.Dropout(0.3),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(head_dropout),
+            nn.Dropout(0.3),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(max(0.0, head_dropout - 0.1)),
+            nn.Dropout(0.2),
             nn.Linear(64, 1),
         )
 
@@ -230,7 +216,6 @@ def train_xgb_aging_classifier(X_scalar, y, idx_tr, idx_va, idx_te, seed=42):
         oof_proba[b] = _aligned_proba(clf, Xt[b])
 
     final_clf = XGBClassifier(random_state=seed, **base_kwargs)
-    # use a small hold-out from train for early stopping on final model
     rng = np.random.default_rng(seed)
     es_idx = rng.choice(len(Xt), size=max(1, len(Xt) // 5), replace=False)
     tr_idx = np.setdiff1d(np.arange(len(Xt)), es_idx)
@@ -278,14 +263,37 @@ def build_cell_tensors(cells_cache, cycles=CYCLES_TO_USE):
     return X, eol, names
 
 
-def eol_accuracy(preds, tgts, band=0.10):
+def build_scalar_features(X):
+    
+    x = X.numpy() if isinstance(X, torch.Tensor) else np.asarray(X)
+    feat_mean  = x.mean(axis=1)
+    feat_std   = x.std(axis=1)
+    feat_slope = x[:, -1, :] - x[:, 0, :]
+    feat_min   = x.min(axis=1)
+    feat_max   = x.max(axis=1)
+    feat_q25   = np.percentile(x, 25, axis=1)
+    feat_q75   = np.percentile(x, 75, axis=1)
+    n_cyc = x.shape[1]
+    q = max(1, n_cyc // 4)
+    feat_early  = x[:, :q, :].mean(axis=1)
+    feat_late   = x[:, -q:, :].mean(axis=1)
+    feat_deltas = np.diff(x, axis=1).reshape(x.shape[0], -1)
+    scalar = np.concatenate([
+        feat_mean, feat_std, feat_slope,
+        feat_min, feat_max, feat_q25, feat_q75,
+        feat_early, feat_late, feat_deltas,
+    ], axis=1)
+    return np.nan_to_num(scalar, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def eol_accuracy(preds, tgts, band=0.15):
     preds = np.asarray(preds, dtype=float)
     tgts = np.asarray(tgts, dtype=float)
     denom = np.clip(np.abs(tgts), 1e-8, None)
     return float(np.mean(np.abs(preds - tgts) / denom <= band))
 
 
-BLEND_ALPHA_MAX = 0.25 
+BLEND_ALPHA_MAX = 0.25  
 
 def fit_class_blend(preds_va, tgts_va, proba_va, class_means):
     expected_from_class = np.asarray(proba_va, dtype=float) @ np.asarray(class_means, dtype=float)
@@ -442,8 +450,6 @@ def train_model(X_train, y_train, X_val, y_val,
         cnn_channels=_mcfg["cnn_channels"],
         gru_hidden_size=_mcfg["gru_hidden"],
         num_layers=_mcfg["num_layers"],
-        cnn_dropout=_mcfg["cnn_dropout"],
-        head_dropout=_mcfg["head_dropout"],
     ).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     if _sched == "onecycle":
@@ -583,10 +589,34 @@ def make_eval_loader(X, y, y_mean, y_std, batch_size=8):
     return DataLoader(TensorDataset(X, y_norm), batch_size=batch_size)
 
 
+def dqdv_window_cols(window, n_features):
+    """Per-cycle feature-column indices for a dQ/dV voltage-window selection.
+
+    window : 'all' / None -> every column;
+             'none'       -> only the non-dQ/dV features (+ SOH);
+             int w        -> window w's 3 dQ/dV stats + all non-dQ/dV features.
+    """
+    if window is None or window == "all":
+        return None
+    other = list(range(N_DQDV_FEATS, n_features))
+    if window == "none":
+        return other
+    w = int(window)
+    if not (0 <= w < len(DQDV_V_WINDOWS)):
+        raise ValueError(f"dQ/dV window {w} out of range 0..{len(DQDV_V_WINDOWS) - 1}")
+    return [3 * w, 3 * w + 1, 3 * w + 2] + other
+
+
 if __name__ == "__main__":
     cells_cache = load_cache()
     X_all, eol_all, names = build_cell_tensors(cells_cache)
-    print(f"After EOL filter: {len(names)} cells | seq shape {tuple(X_all.shape)}")
+
+    _win = os.environ.get("EOL_DQDV_WINDOW", "all")
+    _cols = dqdv_window_cols(_win, X_all.size(-1))
+    if _cols is not None:
+        X_all = X_all[:, :, _cols]
+    print(f"[dQ/dV window: {_win}] After EOL filter: {len(names)} cells | "
+          f"seq shape {tuple(X_all.shape)}")
 
     split = load_fixed_split()
     name_to_idx = {n: i for i, n in enumerate(names)}
@@ -615,26 +645,7 @@ if __name__ == "__main__":
     eol_va = eol_all[idx_va]
     eol_te = eol_all[idx_te]
 
-    X_np = X_all.numpy()
-    feat_mean   = X_np.mean(axis=1)
-    feat_std    = X_np.std(axis=1)
-    feat_slope  = X_np[:, -1, :] - X_np[:, 0, :]
-    feat_min    = X_np.min(axis=1)
-    feat_max    = X_np.max(axis=1)
-    feat_q25    = np.percentile(X_np, 25, axis=1)
-    feat_q75    = np.percentile(X_np, 75, axis=1)
-    n_cyc = X_np.shape[1]
-    q = max(1, n_cyc // 4)
-    feat_early  = X_np[:, :q, :].mean(axis=1)
-    feat_late   = X_np[:, -q:, :].mean(axis=1)
-    # consecutive-cycle deltas: rate of change between each pair of selected cycles
-    feat_deltas = np.diff(X_np, axis=1).reshape(X_np.shape[0], -1)
-    scalar_X = np.concatenate([
-        feat_mean, feat_std, feat_slope,
-        feat_min, feat_max, feat_q25, feat_q75,
-        feat_early, feat_late, feat_deltas,
-    ], axis=1).astype(np.float32)
-    scalar_X = np.nan_to_num(scalar_X, nan=0.0, posinf=0.0, neginf=0.0)
+    scalar_X = build_scalar_features(X_all)
 
     eol_np = eol_all.squeeze(-1).numpy()
     y_all, (q33, q66) = labels_from_train_tertiles(eol_np, eol_np[idx_tr.numpy()])
@@ -743,7 +754,7 @@ if __name__ == "__main__":
     )
 
     print("\n[Test set]")
-    test_loader = make_eval_loader(X_te, eol_te, y_mean, y_std, batch_size=8)
+    test_loader = make_eval_loader(X_te, eol_te, y_mean, y_std, batch_size=1)
     preds_te, tgts_te, test_metrics = evaluate(model, test_loader, y_mean, y_std, split_name="Test")
     preds_te_blend = apply_class_blend(preds_te, proba_te, class_means, blend_alpha)
     raw_test_mae = float(np.mean(np.abs(preds_te - tgts_te)))
@@ -794,7 +805,6 @@ if __name__ == "__main__":
             },
             ckpt_path,
         )
-
         _clf.get_booster().save_model(os.path.join(_HERE, "aging_classifier_cnn_gru_50_xgb.json"))
         print(f"Saved best model -> {ckpt_path}")
         print("Saved aging classifier -> aging_classifier_cnn_gru_50_xgb.json")

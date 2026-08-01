@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from xgboost import XGBClassifier
-from featureExtrcation.processDatasets import HUSTDataProcessor
+from featureExtrcation.processDatasets import (
+    HUSTDataProcessor, DQDV_V_WINDOWS, N_DQDV_FEATS,
+)
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +23,7 @@ SPLIT_FILE = os.path.join(_HERE, "cell_split.json")
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 _raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
-CYCLES_TO_USE = [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()] or [*range(1,51), *range(100, 151), *range(200, 251)]
+CYCLES_TO_USE = [int(c) for c in _raw_cycles.split(",") if c.strip().isdigit()] or [1,10,50,100,150,200,250]
 CLASS_NAMES = ["Fast", "Normal", "Slow"]
 N_CLASSES = 3
 MIN_EOL_CYCLES = 200
@@ -105,7 +107,7 @@ class EOLTransformer(nn.Module):
 
 
 
-def eol_accuracy(preds, tgts, band=0.15):
+def eol_accuracy(preds, tgts, band=0.10):
     preds = np.asarray(preds, dtype=float)
     tgts = np.asarray(tgts, dtype=float)
     denom = np.clip(np.abs(tgts), 1e-8, None)
@@ -572,11 +574,35 @@ def build_cell_tensors(cells_cache, cycles=CYCLES_TO_USE):
     return X, eol, names
 
 
-if __name__ == "__main__":
+def dqdv_window_cols(window, n_features):
+    """Per-cycle feature-column indices for a dQ/dV voltage-window selection.
 
+    window : 'all' / None -> every column;
+             'none'       -> only the non-dQ/dV features (+ SOH);
+             int w        -> window w's 3 dQ/dV stats + all non-dQ/dV features.
+    """
+    if window is None or window == "all":
+        return None
+    other = list(range(N_DQDV_FEATS, n_features))
+    if window == "none":
+        return other
+    w = int(window)
+    if not (0 <= w < len(DQDV_V_WINDOWS)):
+        raise ValueError(f"dQ/dV window {w} out of range 0..{len(DQDV_V_WINDOWS) - 1}")
+    return [3 * w, 3 * w + 1, 3 * w + 2] + other
+
+
+if __name__ == "__main__":
     cells_cache = load_cache()
     X_all, eol_all, names = build_cell_tensors(cells_cache)
-    print(f"After EOL filter: {len(names)} cells | seq shape {tuple(X_all.shape)}")
+
+    _win = os.environ.get("EOL_DQDV_WINDOW", "all")
+    _cols = dqdv_window_cols(_win, X_all.size(-1))
+    if _cols is not None:
+        X_all = X_all[:, :, _cols]
+    print(f"[dQ/dV window: {_win}] After EOL filter: {len(names)} cells | "
+          f"seq shape {tuple(X_all.shape)}")
+
     split = load_fixed_split()
     name_to_idx = {n: i for i, n in enumerate(names)}
 

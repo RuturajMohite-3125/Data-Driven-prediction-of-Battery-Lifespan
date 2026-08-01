@@ -16,3 +16,4 @@ __pycache__/
 content_bml/
 *.png
 *.pkl
+Models/*.json
