@@ -12,7 +12,9 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 from xgboost import XGBClassifier
 
-from featureExtrcation.processDatasets import HUSTDataProcessor
+from featureExtrcation.processDatasets import (
+    HUSTDataProcessor, DQDV_V_WINDOWS, N_DQDV_FEATS,
+)
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -587,10 +589,34 @@ def make_eval_loader(X, y, y_mean, y_std, batch_size=8):
     return DataLoader(TensorDataset(X, y_norm), batch_size=batch_size)
 
 
+def dqdv_window_cols(window, n_features):
+    """Per-cycle feature-column indices for a dQ/dV voltage-window selection.
+
+    window : 'all' / None -> every column;
+             'none'       -> only the non-dQ/dV features (+ SOH);
+             int w        -> window w's 3 dQ/dV stats + all non-dQ/dV features.
+    """
+    if window is None or window == "all":
+        return None
+    other = list(range(N_DQDV_FEATS, n_features))
+    if window == "none":
+        return other
+    w = int(window)
+    if not (0 <= w < len(DQDV_V_WINDOWS)):
+        raise ValueError(f"dQ/dV window {w} out of range 0..{len(DQDV_V_WINDOWS) - 1}")
+    return [3 * w, 3 * w + 1, 3 * w + 2] + other
+
+
 if __name__ == "__main__":
     cells_cache = load_cache()
     X_all, eol_all, names = build_cell_tensors(cells_cache)
-    print(f"After EOL filter: {len(names)} cells | seq shape {tuple(X_all.shape)}")
+
+    _win = os.environ.get("EOL_DQDV_WINDOW", "all")
+    _cols = dqdv_window_cols(_win, X_all.size(-1))
+    if _cols is not None:
+        X_all = X_all[:, :, _cols]
+    print(f"[dQ/dV window: {_win}] After EOL filter: {len(names)} cells | "
+          f"seq shape {tuple(X_all.shape)}")
 
     split = load_fixed_split()
     name_to_idx = {n: i for i, n in enumerate(names)}
