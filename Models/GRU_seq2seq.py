@@ -21,7 +21,7 @@ from featureExtrcation.processDatasets import (
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(_HERE, "processed_hust_MIT_cache.pkl")
 RAW_PKL_PATH = "/Users/ruturaj/Master-Thesis/Dataset/MIT"
-SPLIT_FILE = os.path.join(_HERE, "hust_cell_split.json")
+SPLIT_FILE = os.path.join(_HERE, "mix_cell_split.json")
 SPLIT_KEY_MAP = {"Training": "train", "Validation": "val", "Testing": "test"}
 
 _raw_cycles = os.environ.get("EOL_CYCLES_TO_USE", "")
@@ -47,20 +47,35 @@ else:
 SHOW_PLOTS = os.environ.get("EOL_SHOW_PLOTS", "1") == "1"
 SAVE_ARTIFACTS = os.environ.get("EOL_SAVE_ARTIFACTS", "1") == "1"
 
+
 MODEL_CFG = {
     "hidden_size":  int(os.environ.get("EOL_HIDDEN_SIZE",  "128")),
     "num_layers":   int(os.environ.get("EOL_NUM_LAYERS",   "1")),
-    "head_dropout": float(os.environ.get("EOL_HEAD_DROPOUT", "0.3")),
+    "head_dropout": float(os.environ.get("EOL_HEAD_DROPOUT", "0.5")),
 }
 TRAIN_CFG = {
-    "epochs":       int(os.environ.get("EOL_EPOCHS",       "300")),
-    "batch_size":   int(os.environ.get("EOL_BATCH_SIZE",   "4")),
+    "epochs":       int(os.environ.get("EOL_EPOCHS",       "120")),
+    "batch_size":   int(os.environ.get("EOL_BATCH_SIZE",   "8")),
     "lr":           float(os.environ.get("EOL_LR",           "3e-4")),
-    "weight_decay": float(os.environ.get("EOL_WEIGHT_DECAY", "5e-3")),
-    "lambda_eol":   float(os.environ.get("EOL_LAMBDA_EOL",   "1.5")),
+    "weight_decay": float(os.environ.get("EOL_WEIGHT_DECAY", "5e-2")),
+    "lambda_eol":   float(os.environ.get("EOL_LAMBDA_EOL",   "1.0")),
 }
 LOSS_TYPE = os.environ.get("EOL_LOSS", "smooth_l1")
 SCHEDULER = os.environ.get("EOL_SCHEDULER", "cosine")
+
+
+USE_LOG_TARGET = os.environ.get("EOL_LOG_TARGET", "1") == "1"
+
+
+def to_target(eol):
+    """Map raw EOL (tensor) into the model's training target space."""
+    return torch.log(eol.clamp(min=1e-6)) if USE_LOG_TARGET else eol
+
+
+def from_target(t):
+    """Invert to_target: model space -> raw cycles (numpy)."""
+    t = np.asarray(t, dtype=float)
+    return np.exp(t) if USE_LOG_TARGET else t
 
 
 class PositionalEncoding(nn.Module):
@@ -512,6 +527,7 @@ def evaluate(model, loader, y_mean, y_std, split_name="Test"):
             t = yb.numpy() * y_std + y_mean
             preds.append(p); tgts.append(t)
     preds = np.concatenate(preds); tgts = np.concatenate(tgts)
+    preds = from_target(preds); tgts = from_target(tgts)
     abs_err = np.abs(preds - tgts)
     denom = np.clip(np.abs(tgts), 1e-8, None)
     rel_err = abs_err / denom
@@ -702,21 +718,23 @@ if __name__ == "__main__":
 
     print(f"\nTrain tensor: {tuple(X_tr.shape)} (per-cycle features + 3 aging-class probs) | device: {DEVICE}")
 
+    tgt_space = "log(EOL)" if USE_LOG_TARGET else "EOL"
     model, (y_mean, y_std), history, val_loader, best_mae = train_model(
         X_tr,
-        eol_tr,
+        to_target(eol_tr),
         X_va,
-        eol_va,
+        to_target(eol_va),
         model_cfg=MODEL_CFG,
         loss_type=LOSS_TYPE,
         scheduler=SCHEDULER,
         **TRAIN_CFG,
     )
 
-    print(f"\nBest val MAE: {best_mae:.2f} cycles ({'MEETS' if best_mae <= 50 else 'ABOVE'} +-50 cycle target)")
+    
+    print(f"\nBest val loss (normalized {tgt_space}): {best_mae:.4f}")
 
     print("\n[Train set]")
-    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=1)
+    train_loader = make_eval_loader(X_tr, to_target(eol_tr), y_mean, y_std, batch_size=1)
     preds_tr, tgts_tr, train_metrics = evaluate(model, train_loader, y_mean, y_std, split_name="Train")
 
     print("\n[Validation set]")
@@ -730,7 +748,7 @@ if __name__ == "__main__":
     )
 
     print("\n[Test set]")
-    test_loader = make_eval_loader(X_te, eol_te, y_mean, y_std, batch_size=1)
+    test_loader = make_eval_loader(X_te, to_target(eol_te), y_mean, y_std, batch_size=1)
     preds_te, tgts_te, test_metrics = evaluate(model, test_loader, y_mean, y_std, split_name="Test")
     preds_te_blend = apply_class_blend(preds_te, proba_te, class_means, blend_alpha)
     raw_test_mae = float(np.mean(np.abs(preds_te - tgts_te)))

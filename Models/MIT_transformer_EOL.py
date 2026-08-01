@@ -55,6 +55,19 @@ _CFG_LAMBDA_EOL   = float(os.environ.get("EOL_LAMBDA_EOL", "1.5"))
 _CFG_LOSS_TYPE    = os.environ.get("EOL_LOSS_TYPE",         "smooth_l1")
 _CFG_SCHEDULER    = os.environ.get("EOL_SCHEDULER",         "cosine")
 
+USE_LOG_TARGET = os.environ.get("EOL_LOG_TARGET", "1") == "1"
+
+
+def to_target(eol):
+    """Map raw EOL (tensor) into the model's training target space."""
+    return torch.log(eol.clamp(min=1e-6)) if USE_LOG_TARGET else eol
+
+
+def from_target(t):
+    """Invert to_target: model space -> raw cycles (numpy)."""
+    t = np.asarray(t, dtype=float)
+    return np.exp(t) if USE_LOG_TARGET else t
+
 
 
 
@@ -248,6 +261,8 @@ def evaluate(model, loader, y_mean, y_std, split_name="Test"):
             t = yb.numpy() * y_std + y_mean
             preds.append(p); tgts.append(t)
     preds = np.concatenate(preds); tgts = np.concatenate(tgts)
+    
+    preds = from_target(preds); tgts = from_target(tgts)
     abs_err = np.abs(preds - tgts)
     denom = np.clip(np.abs(tgts), 1e-8, None)
     rel_err = abs_err / denom
@@ -708,15 +723,15 @@ if __name__ == "__main__":
           f"(per-cycle features + 3 aging-class probs) | device: {DEVICE}")
 
     model, (y_mean, y_std), history, val_loader, best_mae = train_model(
-        X_tr, eol_tr, X_va, eol_va,
+        X_tr, to_target(eol_tr), X_va, to_target(eol_va),
         epochs=300, batch_size=4, lr=3e-4, weight_decay=5e-3, lambda_eol=1.5
     )
 
-    print(f"\nBest val MAE: {best_mae:.2f} cycles "
-          f"({'MEETS' if best_mae <= 40 else 'ABOVE'} +-40 cycle target)")
+   
+    print(f"\nBest val loss (normalized {'log(EOL)' if USE_LOG_TARGET else 'EOL'}): {best_mae:.4f}")
 
     print("\n[Train set]")
-    train_loader = make_eval_loader(X_tr, eol_tr, y_mean, y_std, batch_size=4)
+    train_loader = make_eval_loader(X_tr, to_target(eol_tr), y_mean, y_std, batch_size=4)
     preds_tr, tgts_tr, train_metrics = evaluate(model, train_loader, y_mean, y_std, split_name="Train")
 
     print("\n[Validation set]")
@@ -733,7 +748,7 @@ if __name__ == "__main__":
 
     print("\n[Test set]")
     test_loader = DataLoader(
-        TensorDataset(X_te, ((eol_te.squeeze(-1) - y_mean) / y_std)),
+        TensorDataset(X_te, ((to_target(eol_te).squeeze(-1) - y_mean) / y_std)),
         batch_size=1,
     )
     preds_te, tgts_te, test_metrics = evaluate(model, test_loader, y_mean, y_std, split_name="Test")
