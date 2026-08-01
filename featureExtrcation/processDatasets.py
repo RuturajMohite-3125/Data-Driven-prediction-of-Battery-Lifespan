@@ -27,6 +27,57 @@ DQDV_WINDOW = (100, 900)
 DQDV_SMOOTH_KERNEL = 10
 
 
+
+DQDV_V_RANGE = (2.0, 3.6)     # full discharge voltage range (V)
+DQDV_WINDOW_SIZE = 0.2        # width of each voltage window (V)
+
+
+def _build_dqdv_windows(v_range=DQDV_V_RANGE, size=DQDV_WINDOW_SIZE):
+    """Split [v_lo, v_hi] into consecutive windows of width `size`"""
+    lo, hi = v_range
+    n = int(np.floor((hi - lo) / size + 1e-9))
+    edges = [round(lo + k * size, 6) for k in range(n + 1)]
+    if edges[-1] < hi - 1e-9:
+        edges.append(round(hi, 6))
+    return [(float(edges[i]), float(edges[i + 1])) for i in range(len(edges) - 1)]
+
+
+DQDV_V_WINDOWS = _build_dqdv_windows()
+N_DQDV_FEATS = 3 * len(DQDV_V_WINDOWS)   
+
+
+def dqdv_feature_names(windows=DQDV_V_WINDOWS):
+    """Column names for the per-window dQ/dV features, in order."""
+    names = []
+    for lo, hi in windows:
+        tag = f"{lo:g}-{hi:g}"
+        names += [f"dQdV_max_{tag}", f"dQdV_min_{tag}", f"dQdV_var_{tag}"]
+    return names
+
+
+def _dqdv_window_stats(dqdv, v_grid, windows=DQDV_V_WINDOWS, kernel=DQDV_SMOOTH_KERNEL):
+    """Per voltage-window (max, min, var) of a dQ/dV curve.
+
+    dqdv / v_grid : the dQ/dV values and their matching voltage grid.
+    Returns a list of (max, min, var) tuples, one per window; empty windows
+    yield (0, 0, 0)."""
+    dqdv = np.asarray(dqdv, dtype=np.float32).reshape(-1)
+    v_grid = np.asarray(v_grid, dtype=np.float32).reshape(-1)
+    n = min(dqdv.size, v_grid.size)
+    dqdv, v_grid = dqdv[:n], v_grid[:n]
+
+    stats = []
+    for lo, hi in windows:
+        seg = dqdv[(v_grid >= lo) & (v_grid < hi)]
+        if seg.size >= kernel:
+            seg = np.convolve(seg, np.ones(kernel) / kernel, mode='valid')
+        if seg.size == 0:
+            stats.append((0.0, 0.0, 0.0))
+        else:
+            stats.append((float(np.max(seg)), float(np.min(seg)), float(np.var(seg))))
+    return stats
+
+
 def _interp_nan(arr):
    
     arr = np.asarray(arr, dtype=np.float32).reshape(-1).copy()
@@ -185,17 +236,18 @@ class HUSTDataProcessor:
         }, discharge_deriv, soh_val
 
     def _extract_cycle_features(self, cycle_data, deriv, deriv_10):
+        
         if deriv is not None:
-            dQdV = _smooth_dqdv_window(deriv["dQdV"])
-            dQdV_10 = _smooth_dqdv_window(deriv_10["dQdV"]) if deriv_10 is not None else np.array([])
-            ref_max = float(np.max(dQdV_10)) if len(dQdV_10) > 0 else 0.0
-            ref_min = float(np.min(dQdV_10)) if len(dQdV_10) > 0 else 0.0
-            ref_var = float(np.var(dQdV_10)) if len(dQdV_10) > 0 else 0.0
-            dQdV_max = float(np.max(dQdV)) - ref_max
-            dQdV_min = float(np.min(dQdV)) - ref_min
-            dQdV_var = float(np.var(dQdV)) - ref_var
+            cur_stats = _dqdv_window_stats(deriv["dQdV"], deriv["V_dQdV"])
+            if deriv_10 is not None:
+                ref_stats = _dqdv_window_stats(deriv_10["dQdV"], deriv_10["V_dQdV"])
+            else:
+                ref_stats = [(0.0, 0.0, 0.0)] * len(DQDV_V_WINDOWS)
+            dqdv_feats = []
+            for (cmax, cmin, cvar), (rmax, rmin, rvar) in zip(cur_stats, ref_stats):
+                dqdv_feats += [cmax - rmax, cmin - rmin, cvar - rvar]
         else:
-            dQdV_max = dQdV_min = dQdV_var = 0.0
+            dqdv_feats = [0.0] * N_DQDV_FEATS
 
         I_c = cycle_data['current_charge']
         V_c = cycle_data['voltage_charge']
@@ -215,8 +267,7 @@ class HUSTDataProcessor:
             max_Q_d      = float(np.max(Q_d))
             coulombic_eff = max_Q_d / max(max_Q_c, 1e-9)
             v_drop_start  = float(V_d[0] - V_d[-1]) if len(V_d) > 1 else 0.0
-            return [
-                dQdV_max, dQdV_min, dQdV_var,
+            return dqdv_feats + [
                 log_std_I, log_std_qc, log_std_V,
                 log_std_Id, log_std_qd, log_std_Vd,
                 float(np.min(I_c)), float(np.max(I_c)),
@@ -227,7 +278,7 @@ class HUSTDataProcessor:
                 coulombic_eff, v_drop_start,
                 cycle_data['charge_time'], cycle_data['discharge_time'],
             ]
-        return [0] * 23
+        return [0.0] * (N_DQDV_FEATS + 20)
 
     def process_and_extract(self, cache_path=None):
         if cache_path and os.path.exists(cache_path):
@@ -264,7 +315,7 @@ class HUSTDataProcessor:
             for idx, item in enumerate(cycles_data):
                 if not isinstance(item, dict):
                     soh_list.append(0.0)
-                    cell_features.append([0.0] * 24)
+                    cell_features.append([0.0] * (N_DQDV_FEATS + 21))
                     continue
 
                 processed, deriv, soh_val = self._process_single_cycle(item, v_grid=v_grid, q_grid=q_grid)
@@ -427,7 +478,7 @@ class HUSTDataProcessor:
             print("No valid cells selected.")
             return
 
-        kurtosis_idx = 18
+        kurtosis_idx = N_DQDV_FEATS + 15
         cmap = plt.cm.viridis
         max_eol = max(c['eol'] for c in resolved)
         norm = plt.Normalize(vmin=0, vmax=max(max_eol, 1))
@@ -662,7 +713,7 @@ class HUSTDataProcessor:
 
         feature_names = ['log_std_I', 'log_std_qc', 'log_std_V',
                           'log_std_Id', 'log_std_qd', 'log_std_Vd']
-        feature_idx = [3, 4, 5, 6, 7, 8]
+        feature_idx = [N_DQDV_FEATS + k for k in range(6)]
 
         n_cycles = min(features.shape[0], eol) if eol > 0 else features.shape[0]
         if n_cycles == 0:
@@ -716,8 +767,7 @@ class HUSTDataProcessor:
         early_cycles : number of initial cycles averaged per cell to build the
                        per-cell feature vector (default 100).
         """
-        feature_names = [
-            'dQdV_max', 'dQdV_min', 'dQdV_var',
+        feature_names = dqdv_feature_names() + [
             'log_std_I', 'log_std_qc', 'log_std_V',
             'log_std_Id', 'log_std_qd', 'log_std_Vd',
             'min_I_c', 'max_I_c', 'min_V_c', 'max_V_c',
@@ -1392,7 +1442,7 @@ if __name__ == "__main__":
     "b2c30", "b2c31", "b2c17", "b2c18", "b3c40", "b3c26", "b3c27"]          # cell names (str) or 0-based indices (int)
     CYCLE_IDS = list(range(1, 250))  # 0-based cycle indices
 
-    processor.plot_dqdv_selected(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
+    #processor.plot_dqdv_selected(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
     #processor.plot_current_profile(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
     #processor.plot_discharge_capacity_vs_voltage(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
     #processor.plot_voltage_kurtosis(cells_cache=cells_cache, cell_ids=CELL_IDS)
@@ -1400,3 +1450,4 @@ if __name__ == "__main__":
     #processor.plot_log_dispersion_features(cells_cache=cells_cache, cell_id="b2c34")
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
     #processor.plot_feature_eol_correlation(cells_cache=cells_cache, early_cycles=100)
+    processor.print_charge_discharge_time(cell_ids=CELL_IDS, cycle_ids=CYCLE_IDS)
