@@ -13,3 +13,6 @@ __pycache__/
 .vscode/
 *.iml
 *.pt
+content_bml/
+*.png
+*.pkl
