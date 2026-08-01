@@ -115,33 +115,35 @@ The project uses the **MIT/Stanford/Toyota LFP battery dataset** (Severson et al
 
 ### Feature Extraction
 
-[featureExtrcation/processDatasets.py](featureExtrcation/processDatasets.py) processes the raw per-cell `.pkl` files into a structured feature cache. For each cycle of each cell, **18 scalar features** are extracted:
+[featureExtrcation/processDatasets.py](featureExtrcation/processDatasets.py) processes the raw per-cell `.pkl` files into a structured feature cache. For each cycle of each cell, **44 scalar features** are extracted:
 
-| Feature Group | Features |
-|---|---|
-| dQ/dV statistics (vs cycle 10 baseline) | `dQdV_min_delta`, `dQdV_var_delta` |
-| Log-scale std (charge phase) | `log_std_I_c`, `log_std_Q_c`, `log_std_V_c` |
-| Log-scale std (discharge phase) | `log_std_I_d`, `log_std_Q_d`, `log_std_V_d` |
-| Current range (charge) | `min_I_c`, `max_I_c` |
-| Voltage range (charge) | `min_V_c`, `max_V_c` |
-| Current range (discharge) | `min_I_d`, `max_I_d` |
-| Voltage range (discharge) | `min_V_d`, `max_V_d` |
-| Capacity + shape | `max_Q_d`, `kurtosis_V_d` |
+| Feature Group | # | Features |
+|---|---|---|
+| **dQ/dV per voltage window** (Δ vs cycle 10 baseline) | **24** | `(max, min, var)` of dQ/dV in each of **8 voltage windows** spanning **2.0–3.6 V in 0.2 V steps** (`dQdV_max_2-2.2`, `dQdV_min_2-2.2`, `dQdV_var_2-2.2`, … `dQdV_var_3.4-3.6`) |
+| Log-scale std (charge phase) | 3 | `log_std_I_c`, `log_std_Q_c`, `log_std_V_c` |
+| Log-scale std (discharge phase) | 3 | `log_std_I_d`, `log_std_Q_d`, `log_std_V_d` |
+| Current range | 4 | `min_I_c`, `max_I_c`, `min_I_d`, `max_I_d` |
+| Voltage range | 4 | `min_V_c`, `max_V_c`, `min_V_d`, `max_V_d` |
+| Capacity + shape | 2 | `max_Q_d`, `kurtosis_V_d` |
+| Efficiency + voltage drop | 2 | `coulombic_eff`, `v_drop_start` |
+| Cycle timing | 2 | `charge_time`, `discharge_time` |
 
-The differential capacity curve dQ/dV is smoothed using a Savitzky-Golay filter (window=31, order=3). Delta features are computed relative to cycle 10 to capture degradation signatures.
+**Voltage-window dQ/dV features.** Rather than a single global `(max, min, var)` summary of the dQ/dV curve, the discharge voltage range `2.0–3.6 V` is split into 8 consecutive `0.2 V` windows (`DQDV_V_RANGE` / `DQDV_WINDOW_SIZE` in the script). Within each window the dQ/dV segment is smoothed with a moving-average kernel (width 10) and reduced to its `(max, min, var)`. Each statistic is stored as a **delta relative to the cycle-10 baseline** so that per-window shifts in the differential-capacity signature — which localise degradation modes to specific voltage plateaus — are captured directly. Empty windows contribute `(0, 0, 0)`.
 
 Each cell is stored in the cache as:
 
 ```python
 {
     'cell_name': str,
-    'features': np.ndarray,   # shape [n_cycles, 18]
+    'features': np.ndarray,   # shape [n_cycles, 44]
     'soh':      np.ndarray,   # discharge capacity per cycle (Ah)
     'soh_traj': np.ndarray,   # normalised SoH, padded to 1500 cycles (-1 sentinel beyond EOL)
     'eol':      int,          # cycle index where capacity < 88% of peak
     'num_cycles': int,
 }
 ```
+
+The 24 dQ/dV columns occupy the first feature positions, so a single voltage window can be isolated at model-input time via `EOL_DQDV_WINDOW` (see [Environment Variables](#environment-variables)).
 
 ### Two-Stage Prediction Pipeline
 
@@ -170,7 +172,7 @@ An XGBoost multi-class classifier is trained on scalar features (mean + slope ac
 
 **Stage 2 — Deep Learning Regressor**
 
-The model receives a sequence of per-cycle features (19–21 dimensions, depending on the appended class probabilities) and produces a single scalar EOL prediction. Training uses Z-score normalisation of targets and early stopping with 80-epoch patience.
+The model receives a sequence of per-cycle features (up to 47 dimensions — the 44 extracted features plus the 3 appended class probabilities; fewer when a single dQ/dV voltage window is selected via `EOL_DQDV_WINDOW`) and produces a single scalar EOL prediction. Training uses Z-score normalisation of targets and early stopping with 80-epoch patience.
 
 
 ### Cycle Windows
@@ -295,7 +297,7 @@ All commands below are run from the **repository root** (with the virtualenv act
 python featureExtrcation/processDatasets.py
 ```
 
-This reads raw per-cell `.pkl` files from `RAW_PKL_PATH` (hard-coded at the bottom of the script — edit it to point at your local dataset copy), extracts 18 per-cycle features for every cell, and writes the cache to `processed_hust_MIT_cache.pkl` **in the current working directory** (the repo root, if run as above). Subsequent runs of this script load from that cache and skip reprocessing.
+This reads raw per-cell `.pkl` files from `RAW_PKL_PATH` (hard-coded at the bottom of the script — edit it to point at your local dataset copy), extracts 44 per-cycle features for every cell, and writes the cache to `processed_hust_MIT_cache.pkl` **in the current working directory** (the repo root, if run as above). Subsequent runs of this script load from that cache and skip reprocessing.
 
 Every model script (`Models/*.py`) instead expects the cache at `Models/processed_hust_MIT_cache.pkl`. Move or copy it there once after generating it:
 
@@ -369,6 +371,7 @@ All model scripts and sweep runners are fully configurable via environment varia
 | Variable | Default | Description |
 |---|---|---|
 | `EOL_CYCLES_TO_USE` | model-specific | Comma-separated cycle indices to use as input (e.g. `1,10,50,100,150,200,250`) |
+| `EOL_DQDV_WINDOW` | `all` | Which dQ/dV voltage window(s) feed the model: `all` (every window's 24 features), `none` (drop dQ/dV, keep only the 20 non-dQ/dV features), or an integer `0–7` (that single window's 3 stats + the non-dQ/dV features) |
 | `EOL_SEED` | `42` | Global random seed |
 | `EOL_SHOW_PLOTS` | `1` | Set to `0` to suppress matplotlib windows |
 | `EOL_SAVE_ARTIFACTS` | `1` | Set to `0` to skip saving model checkpoints |
@@ -387,6 +390,12 @@ All model scripts and sweep runners are fully configurable via environment varia
 
 ```bash
 EOL_CYCLES_TO_USE=1,10,50,100,150,200,250 EOL_SHOW_PLOTS=0 python Models/GRU_seq2seq.py
+```
+
+**Example — train on a single dQ/dV voltage window (e.g. window 3 = 2.6–2.8 V):**
+
+```bash
+EOL_DQDV_WINDOW=3 python Models/GRU_seq2seq.py
 ```
 
 **Example — reproduce the best GRU result (W5 landmarks, Config E):**
